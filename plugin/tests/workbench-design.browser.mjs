@@ -37,9 +37,9 @@ export async function exerciseWorkbenchDesign({ page, screenshot }) {
   await page.getByRole('button', { name: '返回我的 Bug', exact: true }).waitFor()
   await screenshot('workbench-detail', 'dark', 460)
   await page.getByRole('button', { name: '返回我的 Bug', exact: true }).click()
-  await page.getByRole('tab', { name: '登录', exact: true }).click()
+  await page.getByRole('button', { name: '账号配置', exact: true }).click()
   await screenshot('workbench-login', 'dark', 360)
-  await page.getByRole('tab', { name: '我的 Bug', exact: true }).click()
+  await page.getByRole('button', { name: '关闭', exact: true }).click()
   await exercisePaginationAppearance(page, screenshot, items[0])
   return { environment: 'Headless Chrome, production HTML with fictional Worker', checks: ['desktop 885 / panel 460 / narrow 360 without page overflow', 'accurate loaded status counts', 'remove and restore filters', 'footer refresh', 'keyboard detail navigation and return', 'login form narrow layout', 'host light/dark tokens change actual surface', 'paging first/loading/middle/last/error and keyboard focus'], liveOrcaVerified: false }
 }

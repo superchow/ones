@@ -19,6 +19,8 @@ import { ImplementationView } from './implementation.ts'
 import { DetailView } from './detail.ts'
 import { HoursView } from './hours.ts'
 import { RecordsView } from './records.ts'
+import { GitProjectsView } from './git-projects.ts'
+import { defaultPreferences, type Preferences, type PreferenceChange } from '../preferences.ts'
 
 export class WorkbenchUI {
   status: Status | null = null
@@ -26,9 +28,11 @@ export class WorkbenchUI {
   busy = false
   error = ''
   info = ''
+  readonly gitProjects = new GitProjectsView(this)
   readonly hours = new HoursView(this)
   readonly records = new RecordsView(this)
   private tab = 'bugs'
+  private settingsDialog?: HTMLDialogElement
   private epoch = 0
   private controller?: AbortController
   private disposed = false
@@ -39,6 +43,12 @@ export class WorkbenchUI {
   private accounts: Record<Site, string> = { ones: '', coho: '' }
   private passwords: Record<Site, string> = { ones: '', coho: '' }
   private httpConsent = false
+  private preferences = defaultPreferences()
+  private preferencesLoaded = false
+  private preferencesError = ''
+  private preferenceTimer?: ReturnType<typeof setTimeout>
+  private preferenceWrites: Promise<unknown> = Promise.resolve()
+  private remembered = new Map<string, string>()
   /// 已读取的游标缓存；筛选后再按固定大小分页。
   private bugs: Task[] = []
   /// 已确认显示的页码，翻页读取失败时保持不变。
@@ -78,8 +88,58 @@ export class WorkbenchUI {
     void this.start()
   }
   private async start(): Promise<void> {
+    void this.gitProjects.load()
+    let loaded = false
+    try {
+      this.preferences = await request<Preferences>('preferences.load')
+      this.accounts = { ...this.preferences.accounts }
+      this.tab = this.preferences.tab === 'settings' ? 'bugs' : this.preferences.tab
+      this.hours.restoreGit(this.preferences.git)
+      loaded = true
+    } catch { this.preferencesError = '本机设置读取失败，原设置未覆盖。请重新打开插件后重试。' }
     await this.refresh()
+    this.preferencesLoaded = loaded
+    this.render()
     if (!this.disposed && this.tab === 'bugs') void this.loadBugs()
+    if (!this.disposed && this.tab === 'implementation') this.showImplementation()
+  }
+  private restoreFilters(): void {
+    const owner = this.status?.ones.profileKey
+    const saved = owner && this.team ? this.preferences.profiles[`${owner}:${this.team}`] : undefined
+    if (!saved) return
+    this.project = saved.project; this.projectName = saved.projectName
+    this.projectFollowing = saved.projectFollowing; this.statuses = saved.statuses === null ? null : [...saved.statuses]
+    this.hours.restorePreferences(saved.hours)
+  }
+  remember(): void {
+    if (!this.preferencesLoaded || this.disposed) return
+    clearTimeout(this.preferenceTimer)
+    this.preferenceTimer = setTimeout(() => this.savePreferences(), 200)
+  }
+  private savePreferences(): void {
+    if (!this.preferencesLoaded) return
+    const changes: PreferenceChange[] = [
+      { kind: 'tab', value: this.tab },
+      { kind: 'account', site: 'ones', value: this.accounts.ones },
+      { kind: 'account', site: 'coho', value: this.accounts.coho },
+      { kind: 'git', value: this.hours.gitPreferences() }
+    ]
+    const owner = this.status?.ones.profileKey
+    if (owner && this.team) {
+      const value = { project: this.project, projectName: this.projectName, projectFollowing: this.projectFollowing, statuses: this.statuses, hours: this.hours.preferences() }
+      this.preferences.profiles[`${owner}:${this.team}`] = structuredClone(value)
+      this.preferences.teams[owner] = this.team
+      changes.push({ kind: 'team', key: owner, value: this.team }, { kind: 'filters', key: `${owner}:${this.team}`, value })
+    }
+    for (const change of changes) {
+      const key = change.kind + ('key' in change ? change.key : 'site' in change ? change.site : ''), signature = JSON.stringify(change)
+      if (this.remembered.get(key) === signature) continue
+      this.remembered.set(key, signature)
+      this.preferenceWrites = this.preferenceWrites.then(() => request('preferences.update', change)).catch(() => {
+        this.preferencesError = '设置保存失败，最近的修改尚未保存。'
+        if (!this.disposed) this.render()
+      })
+    }
   }
   /// 同步项目跟随；项目改变时统一重置分页并使旧目标页失效。
   private async followProject(focusChanged = false): Promise<void> {
@@ -189,13 +249,16 @@ export class WorkbenchUI {
     this.expanded = false
   }
   private acceptStatus(status: Status): void {
-    const team = status.teams.some((t) => t.id === this.team)
-      ? this.team
+    this.savePreferences()
+    const candidate = status.ones.profileKey ? this.preferences.teams[status.ones.profileKey] ?? this.team : this.team
+    const team = status.teams.some((t) => t.id === candidate)
+      ? candidate
       : status.teams.length === 1
         ? status.teams[0].id
         : ''
     if (
       team !== this.team ||
+      this.status?.ones.profileKey !== status.ones.profileKey ||
       this.status?.ones.label !== status.ones.label ||
       this.status?.ones.connected !== status.ones.connected ||
       this.status?.coho.label !== status.coho.label ||
@@ -204,6 +267,7 @@ export class WorkbenchUI {
       this.clearBusiness()
     this.team = team
     this.status = status
+    this.restoreFilters()
   }
   private async refresh(): Promise<void> {
     await this.run(
@@ -213,7 +277,9 @@ export class WorkbenchUI {
   }
   private async login(site: Site): Promise<void> {
     if (this.busy) return
+    this.savePreferences()
     this.clearBusiness()
+    this.restoreFilters()
     let password = this.passwords[site]
     this.passwords[site] = ''
     try {
@@ -236,7 +302,9 @@ export class WorkbenchUI {
   }
   private logout(site: Site): void {
     if (this.busy) return
+    this.savePreferences()
     this.clearBusiness()
+    this.restoreFilters()
     this.passwords[site] = ''
     void this.run(
       (signal) => request<Status>('auth.logout', { site }, signal),
@@ -268,6 +336,7 @@ export class WorkbenchUI {
     this.error = ''
     this.info = ''
     this.render()
+    if (value === 'git') void this.gitProjects.load()
     if (value === 'bugs') {
       if (returningToBugs && this.bugLoaded) void this.showBugPage(this.bugPage)
       else void this.loadBugs()
@@ -406,12 +475,58 @@ export class WorkbenchUI {
         ...(this.status?.teams ?? []).map((t) => ({ value: t.id, label: t.name }))
       ],
       (value) => {
+        this.savePreferences()
         this.team = value
         this.clearBusiness()
+        this.restoreFilters()
         this.render()
       },
       this.busy
     )
+  }
+  private openSettings(): void {
+    if (this.settingsDialog) return
+    const dialog = el('dialog', 'account-dialog')
+    dialog.setAttribute('aria-labelledby', 'account-settings-title')
+    dialog.addEventListener('cancel', (event) => {
+      event.preventDefault()
+      if (!this.busy) dialog.close()
+    })
+    dialog.addEventListener('close', () => {
+      this.settingsDialog = undefined
+      dialog.remove()
+      this.passwords = { ones: '', coho: '' }
+      this.render()
+      document.getElementById('account-settings-trigger')?.focus({ preventScroll: true })
+      if (this.tab === 'bugs' && !this.bugLoaded && !this.bugLoading) void this.loadBugs()
+      if (this.tab === 'implementation' && !this.implementation && !this.detail) this.showImplementation()
+    })
+    this.settingsDialog = dialog
+    document.body.append(dialog)
+    this.render()
+    dialog.showModal()
+  }
+  private renderSettings(): void {
+    const dialog = this.settingsDialog
+    if (!dialog) return
+    const scroll = dialog.scrollTop
+    const close = button('关闭', () => dialog.close(), this.busy)
+    close.id = 'account-settings-close'
+    close.autofocus = true
+    dialog.replaceChildren(
+      el('div', 'row account-dialog-header', el('h1', '', '账号配置'), close),
+      stack(
+        ...(this.busy ? [row(notice('正在处理，请勿重复提交'), button('取消当前请求', () => this.cancel()))] : []),
+        ...(this.error ? [notice(this.error, true)] : []),
+        ...(this.info ? [notice(this.info)] : []),
+        ...(this.preferencesError ? [notice(this.preferencesError, true)] : []),
+        this.settings()
+      )
+    )
+    dialog.querySelector('h1')!.id = 'account-settings-title'
+    const consent = dialog.querySelector<HTMLInputElement>('input[type=checkbox]')
+    if (consent) consent.id = 'account-http-consent'
+    dialog.scrollTop = scroll
   }
   private settings(): HTMLElement {
     const login = (site: Site) => {
@@ -421,6 +536,7 @@ export class WorkbenchUI {
         site === 'ones' ? 'ONES · 内网项目管理' : 'Coho · 本人考勤',
         text(site === 'ones' ? 'aputureones.com:8088' : 'w.coho.net.cn · ATS', true),
         text(connection?.connected ? connection.label : '未登录', true),
+        connection?.message ? notice(connection.message, true) : null,
         input(
           site === 'ones' ? 'ONES 邮箱' : 'Coho 账号',
           this.accounts[site],
@@ -464,7 +580,7 @@ export class WorkbenchUI {
       )
     }
     return stack(
-      text('密码仅用于本次登录，不保存；令牌由 Worker 存入系统保护的插件凭证库。', true),
+      text('账号和页面设置自动保存。密码仅用于本次登录；令牌加密保存，ONES 支持续期，Coho 按服务端有效期恢复。', true),
       login('ones'),
       (this.status?.teams.length ?? 0) > 1 ? this.teamSelect() : null,
       login('coho'),
@@ -605,7 +721,7 @@ export class WorkbenchUI {
           this.bugLoading ? '正在读取' : this.bugError ? '读取异常' : this.bugLoaded ? '已读取' : '未读取')
       ),
       this.status?.ones.connected && !this.team
-        ? notice('请在登录页选择 ONES 团队；多团队账号不默选。')
+        ? notice('请点击顶部用户图标，在账号配置中选择 ONES 团队；多团队账号不默选。')
         : null,
       this.bugLoading ? notice('正在刷新缺陷…') : null,
       this.bugError ? notice(this.bugError + ' 本次结果不完整。', true) : null,
@@ -696,6 +812,7 @@ export class WorkbenchUI {
   }
   render(): void {
     if (this.disposed) return
+    this.remember()
     const active = document.activeElement,
       focusId = active instanceof HTMLElement ? active.id : ''
     const selection =
@@ -703,15 +820,15 @@ export class WorkbenchUI {
         ? [active.selectionStart, active.selectionEnd]
         : null
     const scroll = window.scrollY
-    const nav = el('nav')
+    const nav = el('nav', 'workbench-tabs')
     nav.setAttribute('aria-label', '工作台功能')
     nav.setAttribute('role', 'tablist')
     for (const [value, label] of [
       ['bugs', '我的 Bug'],
       ['implementation', '实施'],
+      ['git', 'Git 关联'],
       ['hours', '考勤工时'],
-      ['recovery', '记录核对'],
-      ['settings', '登录']
+      ['recovery', '记录核对']
     ]) {
       const tab = button(label, () => this.changeTab(value), this.busy)
       tab.prepend(icon(value))
@@ -722,10 +839,10 @@ export class WorkbenchUI {
     const content =
       this.tab === 'bugs'
         ? this.bugList()
-        : this.tab === 'settings'
-          ? this.settings()
-          : this.tab === 'hours'
-            ? this.hours.render()
+        : this.tab === 'hours'
+          ? this.hours.render()
+          : this.tab === 'git'
+            ? this.gitProjects.render()
             : this.tab === 'recovery'
               ? this.records.render()
               : (this.detail?.element ?? this.implementation?.element ?? text('请选择团队后点击“实施”查看执行记录。', true))
@@ -733,6 +850,12 @@ export class WorkbenchUI {
     const connection = (site: Site, label: string) => el('span',
       'connection-badge' + (this.status?.[site].connected ? ' connected' : ''),
       icon('shield'), label + (this.status?.[site].connected ? ' 已认证' : ' 未登录'))
+    const account = button('', () => this.openSettings(), this.busy, 'account-settings-trigger')
+    account.id = 'account-settings-trigger'
+    account.title = '账号配置'
+    account.setAttribute('aria-label', '账号配置')
+    account.setAttribute('aria-haspopup', 'dialog')
+    account.append(icon('settings'))
     this.root.replaceChildren(
       el('header', 'workbench-header',
         el('div', 'planet-scene', el('span', 'planet'), el('span', 'orbit')),
@@ -743,10 +866,10 @@ export class WorkbenchUI {
             text('从问题到实施，从考勤到工时', true)
           )
         ),
-        el('div', 'row connections', connection('ones', 'ONES'), connection('coho', 'Coho')),
-        nav
+        el('div', 'row connections', connection('ones', 'ONES'), connection('coho', 'Coho'), account)
       ),
-      ...(this.busy
+      nav,
+      ...(this.busy && !this.settingsDialog
         ? [
             row(
               notice('正在处理，请勿重复提交'),
@@ -754,10 +877,12 @@ export class WorkbenchUI {
             )
           ]
         : []),
-      ...(this.error ? [notice(this.error, true)] : []),
-      ...(this.info ? [notice(this.info)] : []),
+      ...(this.error && !this.settingsDialog ? [notice(this.error, true)] : []),
+      ...(this.info && !this.settingsDialog ? [notice(this.info)] : []),
+      ...(this.preferencesError ? [notice(this.preferencesError, true), ...(this.preferencesLoaded ? [button('重试保存设置', () => { this.preferencesError = ''; this.remembered.clear(); this.savePreferences(); this.render() })] : [])] : []),
       content
     )
+    this.renderSettings()
     if (focusId) {
       const field = document.getElementById(focusId)
       field?.focus({ preventScroll: true })
@@ -783,8 +908,14 @@ export class WorkbenchUI {
     window.scrollTo(0, scroll)
   }
   dispose(): void {
+    clearTimeout(this.preferenceTimer)
+    this.savePreferences()
+    this.gitProjects.dispose()
+    this.hours.dispose()
     this.implementation?.dispose()
     this.disposed = true
+    this.settingsDialog?.remove()
+    this.settingsDialog = undefined
     this.projectGeneration++
     this.workspaceSubscription?.dispose()
     this.epoch++

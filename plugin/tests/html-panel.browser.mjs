@@ -98,22 +98,21 @@ export async function exerciseHtmlPanel({ evaluate, wait, screenshot }) {
   )
   report.media.urlsRevoked = true
   await click('考勤工时')
-  assert.equal(await enabled('加入分配草稿'), false)
+  assert.equal(await enabled('根据 Git 整理并计算工时'), false)
   assert.equal(await enabled('读取考勤与已有工时'), false)
+  assert.equal(await contains('选择工时工作项'), false)
+  assert.equal(await evaluate(`document.querySelector('[aria-label="展开本地 Git 整理"]')?.getAttribute('aria-expanded')`), 'false')
   await check('已确认 ONES 与 Coho 均为本人账号', true)
   await click('读取考勤与已有工时')
   await waitText('核对考勤依据')
-  await click('读取可分配任务')
-  await wait(
-    `!![...document.querySelectorAll('option')].find(o=>o.textContent.includes('虚构普通任务'))`
-  )
-  await select('上班打卡', '0')
-  await select('下班打卡', '1')
+  assert.equal(await evaluate(`document.getElementById('上班打卡').value`), '0')
+  assert.equal(await evaluate(`document.getElementById('下班打卡').value`), '1')
   await check('已核对本人当日上下班记录，无缺卡、跨日或外勤异常', true)
-  await select('目标任务 / Bug', 'task-fixture')
-  await fill('时长（分钟）', '120')
-  await fill('工作描述（必填）', '虚构：修复与验证')
-  await click('加入分配草稿')
+  await waitText('剩余可填')
+  await click('根据 Git 整理并计算工时')
+  await waitText('待确认工时')
+  assert.equal(await contains('#89 虚构：修复与验证'), true)
+  assert.equal(await contains('虚构普通任务'), true)
   await click('校验并预览')
   await waitText('提交预览')
   await check('我确认上述任务、原日期、时长和每笔描述', true)
@@ -128,18 +127,18 @@ export async function exerciseHtmlPanel({ evaluate, wait, screenshot }) {
   await click('我的 Bug')
   await waitText('当前显示 1 / 已读取 2 项')
   await click('考勤工时')
-  assert.equal(await contains('虚构：修复与验证'), true)
+  assert.equal(await contains('#89 虚构：修复与验证'), true)
   await fill('业务日期（YYYY-MM-DD）', '2026-11-08')
   assert.equal(await contains('提交预览'), false)
-  assert.equal(await enabled('加入分配草稿'), false)
+  assert.equal(await enabled('根据 Git 整理并计算工时'), false)
   await click('恢复草稿')
   await waitText('草稿已恢复')
-  assert.equal(await contains('虚构：修复与验证'), true)
-  assert.equal(await enabled('加入分配草稿'), false)
+  assert.equal(await contains('#89 虚构：修复与验证'), true)
+  assert.equal(await enabled('根据 Git 整理并计算工时'), false)
   report.attendance = {
     requiresEvidence: true,
     normalTaskPreserved: true,
-    manualPreview: true,
+    gitProposedHours: true,
     writeDisabled: true,
     draftAcrossTabs: true,
     dateChangeInvalidates: true
@@ -157,7 +156,7 @@ export async function exerciseHtmlPanel({ evaluate, wait, screenshot }) {
   await check('确认仅补全这条原记录的描述，不改变日期或时长', true)
   assert.equal(await enabled('提交原记录描述补全'), false)
   report.recovery = { ambiguousBlocked: true, descriptionWriteDisabled: true }
-  await click('登录')
+  await evaluate(`document.getElementById('account-settings-trigger').click()`)
   await fill('ONES 邮箱', 'fixture@example.invalid')
   await fill('ONES 密码', 'fixture-only-password')
   assert.equal(await evaluate(`document.getElementById('ONES 密码').type`), 'password')
@@ -165,13 +164,15 @@ export async function exerciseHtmlPanel({ evaluate, wait, screenshot }) {
   await click('登录 ONES')
   await waitText('已完成认证与身份回读')
   assert.equal(await evaluate(`document.getElementById('ONES 密码').value`), '')
+  await click('关闭')
   await click('考勤工时')
   assert.equal(await contains('虚构：修复与验证'), false)
-  await click('登录')
+  await evaluate(`document.getElementById('account-settings-trigger').click()`)
   await fill('ONES 密码', 'another-fixture-password')
+  await click('关闭')
   await click('我的 Bug')
   await wait(`!!document.querySelector('button.bug-item')`)
-  await click('登录')
+  await evaluate(`document.getElementById('account-settings-trigger').click()`)
   assert.equal(await evaluate(`document.getElementById('ONES 密码').value`), '')
   await screenshot('ones-html-login', 'dark')
   report.authentication = { passwordMaskedAndCleared: true, identityChangeClearsDraft: true }
@@ -179,6 +180,7 @@ export async function exerciseHtmlPanel({ evaluate, wait, screenshot }) {
   await wait(
     `document.body.innerText.includes('ONES 未登录')&&!document.body.innerText.includes('正在处理')`
   )
+  await click('关闭')
   await click('我的 Bug')
   await waitText('登录 ONES 后自动读取缺陷')
   assert.equal(await contains('虚构验证：完整正文'), false)
