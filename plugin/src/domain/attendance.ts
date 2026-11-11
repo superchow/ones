@@ -1,7 +1,24 @@
-import { type Allocation, type Attendance, type Worklog, requireThat, minuteOfDay, validDate } from './model.ts'
+import { type Allocation, type Attendance, type AttendanceSelection, type Worklog, requireThat, minuteOfDay, validDate } from './model.ts'
 
-export function attendanceBudget(attendance: Attendance, selected: { start: number; end: number; confirmed: boolean }): number {
+// Select the two unambiguous same-day records without treating selection as
+// confirmation or changing the attendance budget rules.
+export function defaultPunchSelection(attendance: Attendance): { start: number; end: number } | null {
+  if (attendance.punches.length !== 2) return null
+  if (attendance.punches.some(p => p.date !== attendance.date || p.realDate !== attendance.date || p.isNext !== false)) return null
+  try {
+    const times = attendance.punches.map(p => minuteOfDay(p.time))
+    if (times[0] === times[1]) return null
+    return times[0]! < times[1]! ? { start: 0, end: 1 } : { start: 1, end: 0 }
+  } catch { return null }
+}
+
+export function attendanceBudget(attendance: Attendance, selected: AttendanceSelection): number {
   validDate(attendance.date)
+  if (selected.mode === 'manual') {
+    requireThat(selected.confirmed === true, 'attendance', '请确认手动输入的当日工作总时长。')
+    requireThat(Number.isSafeInteger(selected.minutes) && selected.minutes >= 0 && selected.minutes <= 1440, 'attendance', '请输入 0～24 小时的当日工作总时长，精确到整分钟。')
+    return selected.minutes
+  }
   requireThat(selected.confirmed === true, 'attendance', '请先核对本人考勤与上下班打卡。')
   requireThat(attendance.punches.length === 2, 'attendance', '缺卡、多次打卡或异常记录尚未支持自动折算，请先核实考勤。')
   requireThat(Number.isInteger(selected.start) && Number.isInteger(selected.end) && selected.start !== selected.end, 'attendance', '请明确选择上班和下班打卡。')
@@ -15,7 +32,7 @@ export function attendanceBudget(attendance: Attendance, selected: { start: numb
   }
   const a = minuteOfDay(start.time)
   const b = minuteOfDay(end.time)
-  requireThat((a === 540 || (a === 555 && b === 1260)) && b >= 1110 && b <= 1260, 'attendance', '此上下班时段不在已确认工时规则内，不能自动套用 8 小时。')
+  requireThat((a <= 540 || (a === 555 && b === 1260)) && b >= 1110, 'attendance', '此上下班时段不在已确认工时规则内，不能自动套用 8 小时。')
   return 480 + Math.floor(Math.max(0, b - 1140) / 30) * 30
 }
 

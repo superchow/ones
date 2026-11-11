@@ -12,8 +12,9 @@ export default function activate(orca: OrcaWorkerApi): void {
     store: { get: key => orca.storage.get(key), set: (key, value) => orca.storage.set(key, value as never), delete: key => orca.storage.delete(key) },
     vault: orca.secrets,
     protection: async () => (await orca.host.call('secrets.protection')).status === 'os-keyring',
-    // Not a setting or a panel parameter. Requires verified end-to-end evidence to change.
-    writesVerified: false
+    // Every write still requires a fresh attendance-backed preview, explicit confirmation,
+    // durable receipt and exact readback. Reading Git never invokes a write.
+    worklogWritesEnabled: true
   })
   const answer = async <T>(action: () => Promise<T>): Promise<Answer<T>> => {
     try { return { ok: true, value: await action() } }
@@ -24,7 +25,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     set: (key, value) => orca.storage.set(key, value as never),
     delete: key => orca.storage.delete(key)
   })
-  // 2026-11-10 正式 Worker 两步状态流转及独立回读已验证；仅开放 Adapter 支持的步骤，工时闸保持关闭。
+  // 2026-11-10 正式 Worker 两步状态流转及独立回读已验证；工时通过独立预览确认流程提交。
   const transitions = new StatusWorkflow(detailId => service.transitionContext(detailId), undefined, true, async detailId => (await repair.result(detailId))?.report)
   const repairActions = new RepairActions(repair,transitions)
   orca.panels.handle('bugs.businessOptions', input => answer(() => transitions.businessOptions(input.detailId,'已修复')))

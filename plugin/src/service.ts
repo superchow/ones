@@ -16,7 +16,7 @@ import { allPages, mediaIds, type CompleteBug } from './domain/repair-content.ts
 import type { BugContent } from './domain/bug-content.ts'
 export interface Store { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<void>; delete(key: string): Promise<void> }
 export interface Vault { get(key: string): Promise<string | null>; set(key: string, value: string): Promise<void>; delete(key: string): Promise<void> }
-export interface Dependencies { store: Store; vault: Vault; protection(): Promise<boolean>; fetcher?: Fetcher; writesVerified?: boolean }
+export interface Dependencies { store: Store; vault: Vault; protection(): Promise<boolean>; fetcher?: Fetcher; worklogWritesEnabled?: boolean }
 type Snapshot = { input: DayInput; data: Day; identity: string; stamp: string }
 type Confirmation = { view: Preview; snapshot: Snapshot; input: PreviewInput; identity: string }
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
@@ -131,7 +131,7 @@ export class Workbench {
     await this.ensureReady()
     await Promise.allSettled((['ones', 'coho'] as const).map(site => this.ensureSession(site)))
     const ones = this.sessions.ones; const coho = this.sessions.coho
-    return { ones: { connected: !!ones && ones.expiresAt > Date.now() && !ones.needsValidation, label: ones?.label ?? '未登录', ...(ones ? { profileKey: digest([ONES, ones.userId]) } : {}), ...(this.connectionNotes.ones ? { message: this.connectionNotes.ones } : {}) }, coho: { connected: !!coho && (coho.expiresAt === null || coho.expiresAt > Date.now()), label: coho?.label ?? '未登录', ...(this.connectionNotes.coho ? { message: this.connectionNotes.coho } : {}) }, teams: ones?.teams ?? [], writeEnabled: this.deps.writesVerified === true, blockers: ['工时写入尚待插件端到端验证，当前仅开放预览。', 'Coho 外勤标志与考勤异常规则仍需实例验证。', '执行修复通过 CLI 在已有项目创建聊天；媒体是本地引用，不能直接打开指定 session。', 'Bug 创建与内容修改尚未开放；状态更新按详情中的独立能力闸与字段配置校验，工时写闸不受影响。'] }
+    return { ones: { connected: !!ones && ones.expiresAt > Date.now() && !ones.needsValidation, label: ones?.label ?? '未登录', ...(ones ? { profileKey: digest([ONES, ones.userId]) } : {}), ...(this.connectionNotes.ones ? { message: this.connectionNotes.ones } : {}) }, coho: { connected: !!coho && (coho.expiresAt === null || coho.expiresAt > Date.now()), label: coho?.label ?? '未登录', ...(this.connectionNotes.coho ? { message: this.connectionNotes.coho } : {}) }, teams: ones?.teams ?? [], writeEnabled: this.deps.worklogWritesEnabled === true, blockers: [...(this.deps.worklogWritesEnabled ? [] : ['工时提交未启用，当前仅开放预览。']), '执行修复通过 CLI 在已有项目创建聊天；媒体是本地引用，不能直接打开指定 session。', 'Bug 创建与内容修改尚未开放；状态更新按详情中的独立能力闸与字段配置校验，工时独立预览确认。'] }
   }
   async login(input: LoginInput, signal?: AbortSignal): Promise<Status> {
     await this.ensureReady()
@@ -464,14 +464,15 @@ export class Workbench {
       rows.push({ ...allocation, taskName: task.name })
     }
     requireThat(this.day === snapshot && snapshot.identity === this.identity(), 'stale', '预览期间身份或考勤已变化。')
-    const view = { id: randomUUID(), date: snapshot.input.date, budget, existing: snapshot.data.existing, proposed, remaining: budget - snapshot.data.existing - proposed, rows, expiresAt: Date.now() + 300000 }
+    const view: Preview = { id: randomUUID(), date: snapshot.input.date, budget, existing: snapshot.data.existing, proposed, remaining: budget - snapshot.data.existing - proposed, rows, expiresAt: Date.now() + 300000, basis: input.selection.mode === 'manual' ? 'manual' : 'punches' }
     this.preview = { view, snapshot, input: structuredClone(input), identity: this.identity() }
     return view
   }
   async submit(previewId: string, confirmed: boolean): Promise<{ count: number }> {
-    await this.ensureReady()
-    requireThat(this.deps.writesVerified === true, 'not_verified', '插件工时写入尚未完成端到端验证，当前禁止提交。')
+    await this.ensureReady(); await this.ensureSession('ones')
+    requireThat(this.deps.worklogWritesEnabled === true, 'not_enabled', '当前未启用工时提交。')
     requireThat(!this.writeBusy, 'busy', '另一个写入尚未结束。'); this.writeBusy = true
+    let count = 0
     try {
       const confirmation = this.preview
       requireThat(confirmed === true && confirmation && confirmation.view.id === previewId && confirmation.identity === this.identity() && confirmation.view.expiresAt > Date.now(), 'stale', '请重新预览并确认工时。')
@@ -484,7 +485,6 @@ export class Workbench {
       const scope = digest([ONES, client.team, client.session.userId])
       const ledger = this.ledger()
       const writer = new Submission(ledger, worklogWriter(client))
-      let count = 0
       for (const allocation of confirmation.input.allocations) {
         requireThat(this.identity() === confirmation.identity, 'identity', '身份发生变化，后续提交已停止。')
         await client.task(allocation.taskId)
@@ -496,6 +496,10 @@ export class Workbench {
       }
       this.invalidate()
       return { count }
+    } catch (error) {
+      this.preview = undefined
+      if (count > 0 || !(error instanceof AppError)) throw new AppError('worklog-partial', `本批已有 ${count} 笔完成回读，其余未完成或结果待核实；请先查看工时记录及待核对提交，勿整批重发。`)
+      throw error
     } finally { this.writeBusy = false }
   }
   private ledger(): Ledger {
@@ -567,8 +571,8 @@ export class Workbench {
     } finally { this.writeBusy = false }
   }
   async describe(input: { team: string; date: string; key: string; description: string; confirmed: boolean }) {
-    await this.ensureReady()
-    requireThat(this.deps.writesVerified === true, 'not_verified', '插件描述更新尚未完成端到端验证，当前禁止提交。')
+    await this.ensureReady(); await this.ensureSession('ones')
+    requireThat(this.deps.worklogWritesEnabled === true, 'not_enabled', '当前未启用工时描述更新。')
     requireThat(input.confirmed === true && !this.writeBusy, 'confirmation', '请确认更新且等待其它写入结束。')
     validateDescription(input.description)
     this.writeBusy = true

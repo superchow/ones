@@ -6,12 +6,12 @@ import type { TransitionInput } from './adapters/ones-transitions.ts'
 import type { RepairPreparation, RepairRecord } from './repair.ts'
 import type { BugDetail, Discussion, Attachment, DetailPage } from './adapters/bug-details.ts'
 import type { MediaChunk } from './adapters/bug-media.ts'
-import type { Allocation, Attendance, Option, Preview, Site, Status, Task, TaskPage, Worklog } from './domain/model.ts'
+import type { Allocation, Attendance, AttendanceSelection, Option, Preview, Site, Status, Task, TaskPage, Worklog } from './domain/model.ts'
 export type Answer<T> = { ok: true; value: T } | { ok: false; error: { code: string; message: string } }
 export type LoginInput = { site: Site; account: string; password: string; httpAcknowledged: boolean }
 export type DayInput = { team: string; date: string; mappingConfirmed: boolean }
 export type Day = { id: string; date: string; attendance: Attendance; existing: number; worklogs: Worklog[] }
-export type PreviewInput = { dayId: string; selection: { start: number; end: number; confirmed: boolean }; allocations: Allocation[] }
+export type PreviewInput = { dayId: string; selection: AttendanceSelection; allocations: Allocation[] }
 export type Draft = { date: string; allocations: Allocation[] }
 export type PendingWrite = { id: string; kind: 'add' | 'describe'; date: string; minutes: number; state: 'submitting' | 'unknown'; hasKey: boolean }
 export type RecoveryPreview = { id: string | null; receiptId: string; matchCount: number; candidate: Worklog | null; message: string }

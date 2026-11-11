@@ -5,9 +5,10 @@ export type Task = { id: string; number: number; name: string; project: Option; 
 export type TaskPage = { items: Task[]; nextCursor: string | null }
 export type Punch = { date: string; realDate: string; time: string; isNext: boolean; outFence: boolean | null }
 export type Attendance = { date: string; punches: Punch[]; fetchedAt: number }
+export type AttendanceSelection = { mode?: 'punches'; start: number; end: number; confirmed: boolean } | { mode: 'manual'; minutes: number; confirmed: boolean }
 export type Worklog = { key: string; task: string; owner: string; hours: number; startTime: number; description: string; type: string }
 export type Allocation = { taskId: string; start: string; minutes: number; description: string }
-export type Preview = { id: string; date: string; budget: number; existing: number; proposed: number; remaining: number; rows: (Allocation & { taskName: string })[]; expiresAt: number }
+export type Preview = { id: string; date: string; budget: number; existing: number; proposed: number; remaining: number; rows: (Allocation & { taskName: string })[]; expiresAt: number; basis?: 'punches' | 'manual' }
 export type Status = { ones: Connection; coho: Connection; teams: Option[]; writeEnabled: boolean; blockers: string[] }
 export class AppError extends Error {
   constructor(public code: string, message: string) { super(message); this.name = 'AppError' }

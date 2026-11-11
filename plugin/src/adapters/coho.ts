@@ -68,7 +68,8 @@ export class CohoClient {
       requireThat(typeof v.isNext === 'boolean', 'attendance', '考勤跨日标志不明。')
       return { date: text(v.date, 10), realDate: text(v.realDate, 10), time: text(v.time, 5), isNext: v.isNext, outFence: typeof v.outFence === 'boolean' ? v.outFence : null }
     })
-    requireThat(punches.length > 0, 'attendance', '所选日期无打卡记录，禁止默认填入 8 小时。')
+    // A covered date with no punches can be reviewed with a manually confirmed
+    // daily duration. Never synthesize punches or a default eight-hour budget.
     return { date, punches, fetchedAt: Date.now() }
   }
 }
