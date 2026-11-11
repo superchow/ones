@@ -3,7 +3,7 @@
   "id": "ones-workbench",
   "name": "ONES 工作台",
   "version": "0.1.0",
-  "description": "读取 ONES 工作项；基于 Coho 考勤手动分配工时。未验证写能力默认禁用。",
+  "description": "读取多个本地项目的 Git 日志；基于 Coho 考勤与当日提交整理 Bug/任务工时，确认后写入。",
   "engines": {
     "orca": ">=1.4.254"
   },
