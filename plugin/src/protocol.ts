@@ -1,4 +1,5 @@
 import type { RepairActions } from './repair-actions.ts'
+import type { Preferences, PreferenceChange } from './preferences.ts'
 import type { FolderPage, GitInput, GitReport } from './local-git.ts'
 import type { FolderSelection } from './native-folder-picker.ts'
 import type { GitProjects, GitProjectsChange } from './git-projects.ts'
@@ -22,6 +23,8 @@ export type RecoveryPreview = { id: string | null; receiptId: string; matchCount
 export type ImplementationBrief = { task: Task; text: string; blockedReason: string }
 declare module 'orca' {
   interface PluginRequests {
+    'preferences.load': { output: Answer<Preferences> }
+    'preferences.update': { input: PreferenceChange; output: Answer<{ saved: true }> }
     'bugs.transitionReconcile': { input: { detailId: string; operationId: string }; output: Answer<StatusResult> }
 
     'bugs.projectFilter': { input: { team: string; projects: Option[] }; output: Answer<{ localProject: Option | null; project: Option | null }> }

@@ -2,6 +2,7 @@ import { RepairActions } from './repair-actions.ts'
 import { browseFolders, readGitLogs, resolveFolders } from './local-git.ts'
 import { NativeFolderPicker } from './native-folder-picker.ts'
 import { GitProjectStore } from './git-projects.ts'
+import { PreferenceStore } from './preferences.ts'
 import { StatusWorkflow } from './status-update.ts'
 import { FocusedProject } from './adapters/focused-project.ts'
 import type { OrcaWorkerApi } from 'orca/worker'
@@ -61,6 +62,9 @@ export default function activate(orca: OrcaWorkerApi): void {
   orca.panels.handle('git.folders', input => answer(() => browseFolders(input.path)))
   const folderPicker = new NativeFolderPicker()
   const gitProjects = new GitProjectStore({ get: key => orca.storage.get(key), set: (key, value) => orca.storage.set(key, value as never), delete: key => orca.storage.delete(key) })
+  const preferences = new PreferenceStore({ get: key => orca.storage.get(key), set: (key, value) => orca.storage.set(key, value as never), delete: key => orca.storage.delete(key) })
+  orca.panels.handle('preferences.load', () => answer(() => preferences.load()))
+  orca.panels.handle('preferences.update', input => answer(() => preferences.update(input)))
   orca.panels.handle('git.projects.load', () => answer(() => gitProjects.load()))
   orca.panels.handle('git.projects.update', input => answer(() => gitProjects.update(input)))
   orca.panels.handle('git.pickFolders', (_input, context) => answer(() => folderPicker.pick(context.signal)))
