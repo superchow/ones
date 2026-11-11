@@ -1,6 +1,6 @@
 import { OnesTransitions } from './adapters/ones-transitions.ts'
 import { filterProject, projectMappingKey, type ProjectMapping } from './domain/project-mapping.ts'
-import type { Option } from './domain/model.ts'
+import type { Option, TaskFilter } from './domain/model.ts'
 import { createHash, randomUUID } from 'node:crypto'
 import { type Allocation, type Attendance, type Preview, type Site, type Status, type Worklog, AppError, id, record, requireThat, text, validDate } from './domain/model.ts'
 import { apiHours, attendanceBudget, checkAllocations, existingMinutes, startSeconds, validateDescription } from './domain/attendance.ts'
@@ -219,12 +219,28 @@ export class Workbench {
       return bugs
     })
   }
-  async tasks(team: string, after = '', signal?: AbortSignal) {
-    await this.ensureReady()
+  async projects(team: string, signal?: AbortSignal) {
+    return this.taskOptions(team, client => client.projects(signal), signal)
+  }
+  async iterations(team: string, projectId: string, signal?: AbortSignal) {
+    return this.taskOptions(team, client => client.iterations(projectId, signal), signal)
+  }
+  private async taskOptions(team: string, read: (client: OnesClient) => Promise<Option[]>, signal?: AbortSignal) {
+    await this.ensureReady(); await this.ensureSession('ones')
+    return this.authenticated('ones', async () => {
+      const identity = this.identity(), client = this.ones(team)
+      await client.assertIdentity(signal)
+      const options = await read(client)
+      requireThat(identity === this.identity(), 'stale', '读取期间账号已变化，请重新读取。')
+      return options
+    })
+  }
+  async tasks(team: string, after = '', signal?: AbortSignal, filter: TaskFilter = {}) {
+    await this.ensureReady(); await this.ensureSession('ones')
     return this.authenticated('ones', async () => {
       const identity = this.identity(); const client = this.ones(team)
       await client.assertIdentity(signal)
-      const tasks = await client.tasks(after, signal)
+      const tasks = await client.tasks(after, signal, filter)
       requireThat(identity === this.identity(), 'stale', '读取期间账号已变化，请重新读取。')
       return tasks
     })

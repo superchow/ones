@@ -1,7 +1,8 @@
 export type Site = 'ones' | 'coho'
 export type Connection = { connected: boolean; label: string; profileKey?: string; message?: string }
 export type Option = { id: string; name: string }
-export type Task = { id: string; number: number; name: string; project: Option; issueType: Option; status: Option }
+export type Task = { id: string; number: number; name: string; project: Option; issueType: Option; status: Option; sprint?: Option | null }
+export type TaskFilter = { projectId?: string; sprintId?: string; onlyMine?: boolean }
 export type TaskPage = { items: Task[]; nextCursor: string | null }
 export type Punch = { date: string; realDate: string; time: string; isNext: boolean; outFence: boolean | null }
 export type Attendance = { date: string; punches: Punch[]; fetchedAt: number }

@@ -1,4 +1,5 @@
 import type { RepairActions } from './repair-actions.ts'
+import type { TaskFilter } from './domain/model.ts'
 import type { RepairListItem } from './repair.ts'
 import type { CachedRepairs } from './repair-cache.ts'
 import type { StatusWorkflow, StatusPreview, StatusResult, BusinessInput, BusinessPreview, BusinessResult } from './status-update.ts'
@@ -41,7 +42,9 @@ declare module 'orca' {
     'bugs.media': { input: { detailId: string; resourceId: string; offset: number }; output: Answer<MediaChunk> }
     'bugs.close': { input: { detailId: string }; output: Answer<{closed:true}> }
     'bugs.list': { input: { team: string; after?: string }; output: Answer<TaskPage> }
-    'tasks.list': { input: { team: string; after?: string }; output: Answer<TaskPage> }
+    'tasks.list': { input: { team: string; after?: string; filter?: TaskFilter }; output: Answer<TaskPage> }
+    'tasks.projects': { input: { team: string }; output: Answer<Option[]> }
+    'tasks.iterations': { input: { team: string; projectId: string }; output: Answer<Option[]> }
     'tasks.brief': { input: { team: string; taskId: string }; output: Answer<ImplementationBrief> }
     'day.read': { input: DayInput; output: Answer<Day> }
     'hours.preview': { input: PreviewInput; output: Answer<Preview> }
