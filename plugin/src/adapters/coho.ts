@@ -15,6 +15,7 @@ function headers(token?: string): Record<string, string> {
   }
 }
 function dataOf(result: Record<string, unknown>): Record<string, unknown> {
+  requireThat(result.code !== 401, 'auth', 'Coho 登录已失效，请重新登录。')
   requireThat(result.code === 200, 'coho', 'Coho 认证或业务校验未通过，请重新核对账号和租户。')
   return record(result.data)
 }
@@ -30,9 +31,14 @@ export async function loginCoho(transport: Transport, account: string, password:
   // ATS WorkbenchCalendar uses this authenticated USER_INFO.globalId as its employee key.
   // Verified from the instance frontend; not a rule for other tenants.
   const principal = id(user.globalId)
-  // expTime units/refresh semantics are not verified. Do not invent a local TTL.
-  // Every attendance read validates this token and tenant with the server first.
-  return { token, principal, label: `Coho · ${TENANT}`, expiresAt: null }
+  // ATS user.f017c521.js stores Date.now() + expTime * 1000.
+  const seconds = Number(result.expTime)
+  const expiresAt = Number.isFinite(seconds) && seconds > 0 && seconds <= 31536000 ? Date.now() + seconds * 1000 : null
+  return { token, principal, label: `Coho · ${TENANT}`, expiresAt }
+}
+export async function validateCoho(transport: Transport, session: CohoSession): Promise<CohoSession> {
+  await new CohoClient(transport, session).assertIdentity()
+  return { ...session, expiresAt: Date.now() + 300000 }
 }
 function signed(data: Record<string, unknown>, token: string) {
   const timeStamp = Math.round(Date.now() / 1000)

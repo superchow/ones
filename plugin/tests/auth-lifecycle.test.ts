@@ -29,10 +29,13 @@ test('auth lifecycle: reload restores both sites without network or deletion', a
 })
 
 test('auth lifecycle: transient vault failure retries; malformed/expired records are not erased on restore', async () => {
-  const f = fixture()
+  const f = fixture(async () => { throw Error('offline') })
   let fail = true
   const service = new Workbench({ ...f.deps, vault: { ...f.vault, get: async key => { if (fail) throw Error('locked'); return f.vault.get(key) } } })
-  await assert.rejects(service.status())
+  const unavailable = await service.status()
+  assert.equal(unavailable.ones.connected, false)
+  assert.equal(unavailable.coho.connected, false)
+  assert.match(unavailable.ones.message!, /凭证未删除/)
   fail = false
   assert.equal((await service.status()).ones.connected, true)
   f.data.set('session.ones', JSON.stringify({ ...ones, expiresAt: 1 }))
@@ -49,6 +52,7 @@ test('auth lifecycle: failed replacement login preserves old session across rest
   const before = [...f.data]
   await assert.rejects(f.service.login(login()))
   assert.deepEqual([...f.data], before)
+  assert.equal((await f.service.status()).coho.connected, true)
   assert.equal((await new Workbench(f.deps).status()).coho.connected, true)
 })
 
@@ -109,12 +113,14 @@ test('auth lifecycle: successful login has no invented Coho TTL; explicit logout
 })
 
 test('auth lifecycle: expired ONES cannot send business requests', async () => {
-  let requests = 0
-  const f = fixture(async () => { requests++; throw Error('unexpected network') })
+  const requests: string[] = []
+  const f = fixture(async url => { requests.push(new URL(String(url)).pathname); throw Error('offline') })
   f.data.set('session.ones', JSON.stringify({ ...ones, expiresAt: 1 }))
   await assert.rejects(f.service.bugs('team'))
-  assert.equal(requests, 0)
+  assert.deepEqual(requests, ['/project/api/project/users/me'])
   assert.equal((await f.service.status()).ones.connected, false)
+  assert.ok(requests.every(path => path === '/project/api/project/users/me'))
+  assert.equal(f.data.has('session.ones'), true)
 })
 
 test('auth lifecycle: logout during login persistence cannot resurrect a session', async () => {

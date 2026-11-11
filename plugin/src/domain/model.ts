@@ -1,5 +1,5 @@
 export type Site = 'ones' | 'coho'
-export type Connection = { connected: boolean; label: string }
+export type Connection = { connected: boolean; label: string; profileKey?: string; message?: string }
 export type Option = { id: string; name: string }
 export type Task = { id: string; number: number; name: string; project: Option; issueType: Option; status: Option }
 export type TaskPage = { items: Task[]; nextCursor: string | null }
