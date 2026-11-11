@@ -1,4 +1,7 @@
 import type { RepairActions } from './repair-actions.ts'
+import type { FolderPage, GitInput, GitReport } from './local-git.ts'
+import type { FolderSelection } from './native-folder-picker.ts'
+import type { GitProjects, GitProjectsChange } from './git-projects.ts'
 import type { TaskFilter } from './domain/model.ts'
 import type { RepairListItem } from './repair.ts'
 import type { CachedRepairs } from './repair-cache.ts'
@@ -45,6 +48,12 @@ declare module 'orca' {
     'tasks.list': { input: { team: string; after?: string; filter?: TaskFilter }; output: Answer<TaskPage> }
     'tasks.projects': { input: { team: string }; output: Answer<Option[]> }
     'tasks.iterations': { input: { team: string; projectId: string }; output: Answer<Option[]> }
+    'git.folders': { input: { path?: string }; output: Answer<FolderPage> }
+    'git.pickFolders': { input: Record<string, never>; output: Answer<FolderSelection> }
+    'git.projects.load': { input: Record<string, never>; output: Answer<GitProjects> }
+    'git.projects.update': { input: GitProjectsChange; output: Answer<GitProjects> }
+    'git.resolveFolders': { input: { paths: string[] }; output: Answer<string[]> }
+    'git.read': { input: GitInput; output: Answer<GitReport> }
     'tasks.brief': { input: { team: string; taskId: string }; output: Answer<ImplementationBrief> }
     'day.read': { input: DayInput; output: Answer<Day> }
     'hours.preview': { input: PreviewInput; output: Answer<Preview> }

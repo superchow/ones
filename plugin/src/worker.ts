@@ -1,4 +1,7 @@
 import { RepairActions } from './repair-actions.ts'
+import { browseFolders, readGitLogs, resolveFolders } from './local-git.ts'
+import { NativeFolderPicker } from './native-folder-picker.ts'
+import { GitProjectStore } from './git-projects.ts'
 import { StatusWorkflow } from './status-update.ts'
 import { FocusedProject } from './adapters/focused-project.ts'
 import type { OrcaWorkerApi } from 'orca/worker'
@@ -55,6 +58,14 @@ export default function activate(orca: OrcaWorkerApi): void {
   orca.panels.handle('bugs.attachments', (input, context) => answer(() => service.detailAttachments(input.detailId, input.before, context.signal)))
   orca.panels.handle('bugs.media', (input, context) => answer(() => service.detailMedia(input.detailId, input.resourceId, input.offset, context.signal)))
   orca.panels.handle('bugs.close', input => answer(async () => { service.closeDetail(input.detailId); return {closed:true as const} }))
+  orca.panels.handle('git.folders', input => answer(() => browseFolders(input.path)))
+  const folderPicker = new NativeFolderPicker()
+  const gitProjects = new GitProjectStore({ get: key => orca.storage.get(key), set: (key, value) => orca.storage.set(key, value as never), delete: key => orca.storage.delete(key) })
+  orca.panels.handle('git.projects.load', () => answer(() => gitProjects.load()))
+  orca.panels.handle('git.projects.update', input => answer(() => gitProjects.update(input)))
+  orca.panels.handle('git.pickFolders', (_input, context) => answer(() => folderPicker.pick(context.signal)))
+  orca.panels.handle('git.resolveFolders', input => answer(() => resolveFolders(input.paths)))
+  orca.panels.handle('git.read', (input, context) => answer(() => readGitLogs(input, context.signal)))
   orca.panels.handle('tasks.projects', (input, context) => answer(() => service.projects(input.team, context.signal)))
   orca.panels.handle('tasks.iterations', (input, context) => answer(() => service.iterations(input.team, input.projectId, context.signal)))
   orca.panels.handle('tasks.list', (input, context) => answer(() => service.tasks(input.team, input.after, context.signal, input.filter)))
