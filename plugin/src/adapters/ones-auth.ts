@@ -1,7 +1,38 @@
 import { constants, createHash, publicEncrypt, randomBytes } from 'node:crypto'
 import { AppError, id, record, requireThat, text, type Option } from '../domain/model.ts'
 import { ONES, Transport, jsonBody, readJSON } from './http.ts'
-export type OnesSession = { token: string; userId: string; label: string; teams: Option[]; expiresAt: number }
+export type OnesSession = { token: string; userId: string; label: string; teams: Option[]; expiresAt: number; refreshToken?: string; needsValidation?: boolean }
+
+function tokenFields(tokens: Record<string, unknown>) {
+  const token = text(tokens.access_token, 16000)
+  requireThat(String(tokens.token_type).toLowerCase() === 'bearer' && typeof tokens.expires_in === 'number' && Number.isFinite(tokens.expires_in) && tokens.expires_in > 0 && tokens.expires_in <= 31536000, 'auth_contract', '令牌类型或有效期不受支持。')
+  return { token, expiresAt: Date.now() + tokens.expires_in * 1000, ...(tokens.refresh_token ? { refreshToken: text(tokens.refresh_token, 16000) } : {}) }
+}
+
+// The configured instance advertises refresh_token. Never follow its advertised
+// external endpoint: credentials stay on the same verified login transport.
+export async function refreshOnes(transport: Transport, session: OnesSession): Promise<OnesSession> {
+  requireThat(session.refreshToken, 'auth', '登录已过期，请重新登录 ONES。')
+  const response = await transport.response('/identity/oauth/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'refresh_token', client_id: 'ones.v1', refresh_token: session.refreshToken }).toString() })
+  if (response.status === 400) {
+    const rejected = await response.clone().json().catch(() => ({}))
+    if (rejected.error === 'invalid_grant') throw new AppError('auth', 'ONES 登录授权已失效，请重新登录。')
+  }
+  const fields = tokenFields(await readJSON(response, 'ONES 登录续期'))
+  return { ...session, ...fields, needsValidation: true }
+}
+
+export async function validateOnes(transport: Transport, session: OnesSession): Promise<OnesSession> {
+  const headers = { Authorization: `Bearer ${session.token}` }
+  const me = await transport.json('/project/api/project/users/me', { headers })
+  requireThat(me.uuid === session.userId, 'identity', 'ONES 登录身份已变化，请重新登录。')
+  const info = await transport.json('/project/api/project/auth/token_info', { headers })
+  requireThat(Array.isArray(info.teams), 'auth_contract', 'ONES 团队信息暂不可用。')
+  const teams = info.teams.map(v => { const t = record(v); return { id: id(t.uuid), name: text(t.name) } })
+  // Legacy sessions had an artificial 24-hour limit. An expired local timestamp
+  // without a refresh token is revalidated by the server for a short interval.
+  return { ...session, teams, needsValidation: false, expiresAt: session.expiresAt > Date.now() ? session.expiresAt : Date.now() + 300000 }
+}
 
 // A transient, host-only cookie jar for the identity flow. Never stored or sent to Project API.
 class LoginCookies {
@@ -87,11 +118,11 @@ export async function loginOnes(transport: Transport, account: string, password:
   const code = text(location.searchParams.get('code'), 4000)
   const tokens = await readJSON(await send('/identity/oauth/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'authorization_code', client_id: 'ones.v1', code, code_verifier: verifier, redirect_uri: callback }).toString() }), 'ONES 令牌交换')
   const token = text(tokens.access_token, 16000)
-  requireThat(String(tokens.token_type).toLowerCase() === 'bearer' && typeof tokens.expires_in === 'number' && tokens.expires_in > 0, 'auth_contract', '令牌类型或有效期不受支持。')
+  requireThat(String(tokens.token_type).toLowerCase() === 'bearer' && typeof tokens.expires_in === 'number' && Number.isFinite(tokens.expires_in) && tokens.expires_in > 0 && Number.isSafeInteger(Date.now() + tokens.expires_in * 1000), 'auth_contract', '令牌类型或有效期不受支持。')
   const me = await transport.json('/project/api/project/users/me', { headers: { Authorization: `Bearer ${token}` }, signal })
   requireThat(me.uuid === user && typeof me.email === 'string' && me.email.toLowerCase() === account.toLowerCase(), 'identity', '登录身份回读不匹配。')
   const info = await transport.json('/project/api/project/auth/token_info', { headers: { Authorization: `Bearer ${token}` }, signal })
   requireThat(Array.isArray(info.teams), 'auth_contract', '登录成功，但团队信息接口尚未匹配。')
   const teams = info.teams.map(v => { const t = record(v); return { id: id(t.uuid), name: text(t.name) } })
-  return { token, userId: user, label: text(me.name ?? me.email), teams, expiresAt: Date.now() + Math.min(tokens.expires_in, 86400) * 1000 }
+  return { ...tokenFields(tokens), userId: user, label: text(me.name ?? me.email), teams }
 }

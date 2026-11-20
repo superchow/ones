@@ -1,5 +1,6 @@
 import type { Answer } from '../protocol.ts'
 import type { JsonValue } from 'orca/host'
+import { datePicker } from './date-picker.ts'
 
 export class UIError extends Error {
   /// 保留业务错误码，身份失效时不得继续展示私有缓存。
@@ -69,6 +70,7 @@ export function input(
   change: (value: string) => void,
   options: { type?: string; disabled?: boolean; multiline?: boolean; maxLength?: number } = {}
 ): HTMLElement {
+  if (options.type === 'date' && !options.multiline) return datePicker(label, value, change, !!options.disabled)
   const field = options.multiline ? el('textarea') : el('input')
   field.id = label
   field.value = value

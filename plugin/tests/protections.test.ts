@@ -24,7 +24,7 @@ const row = {taskId:'task-fixture',start:'09:00',minutes:480,description:'虚构
 test('TC-PLUGIN-003: attendance boundaries and no attendance bypass', () => {
   for (const [end,minutes] of [['18:30',480],['19:29',480],['19:30',510],['19:59',510],['20:00',540],['20:29',540],['20:30',570],['21:00',600]] as const) assert.equal(attendanceBudget(attendance('09:00',end),selected),minutes)
   assert.equal(attendanceBudget(attendance('09:15','21:00'),selected),600)
-  for (const value of [attendance('09:15','20:00'),attendance('09:00','18:29'),attendance('09:00','21:01'),{...attendance(),punches:[]},{...attendance(),punches:[...attendance().punches,...attendance().punches]}]) assert.throws(()=>attendanceBudget(value,selected))
+  for (const value of [attendance('09:15','20:00'),attendance('09:00','18:29'),{...attendance(),punches:[]},{...attendance(),punches:[...attendance().punches,...attendance().punches]}]) assert.throws(()=>attendanceBudget(value,selected))
   assert.throws(()=>attendanceBudget(attendance(),{...selected,confirmed:false}))
   assert.throws(()=>attendanceBudget(attendance(),{...selected,start:1,end:0}))
   for (const changed of [{isNext:true},{outFence:undefined},{outFence:'false'},{realDate:'2026-01-06'}]) {
@@ -53,7 +53,7 @@ test('TC-PLUGIN-001: exact origin, OAuth state and password login without browse
       cookieSeen=new Headers(init.headers).get('cookie')==='sid=fixture-cookie'
       return new Response(null,{status:302,headers:{location:`${ONES}/auth/authorize/callback?code=fake-code&state=${state}`}})
     }
-    if(path==='/identity/oauth/token')return json({access_token:'fixture-access',token_type:'Bearer',expires_in:60})
+    if(path==='/identity/oauth/token')return json({access_token:'fixture-access',token_type:'Bearer',expires_in:172800})
     assert.equal(new Headers(init.headers).get('cookie'),null)
     if(path.endsWith('/users/me'))return json({uuid:'user-fixture',email:'fixture@example.test',name:'虚构用户'})
     if(path.endsWith('/auth/token_info'))return json({teams:[{uuid:'team-fixture',name:'虚构团队'}]})
@@ -61,7 +61,7 @@ test('TC-PLUGIN-001: exact origin, OAuth state and password login without browse
   }
   const transport=new Transport(ONES,fetcher)
   const session=await loginOnes(transport,'fixture@example.test','fake-password-only',true)
-  assert.equal(session.userId,'user-fixture');assert.ok(cookieSeen);assert.equal(requests.length,7)
+  assert.ok(session.expiresAt > Date.now() + 86400000);assert.equal(session.userId,'user-fixture');assert.ok(cookieSeen);assert.equal(requests.length,7)
   const before=requests.length
   await assert.rejects(()=>transport.json('https://untrusted.example.test/steal'))
   await assert.rejects(()=>loginOnes(transport,'fixture@example.test','fake-password-only',false))
@@ -95,14 +95,14 @@ test('TC-PLUGIN-003/004: service authority survives stale preview and refuses di
   const mem=memory();const now=Date.now()
   mem.data.set('session.ones',JSON.stringify({token:'fixture-access',userId:'user-fixture',label:'虚构',teams:[{id:'team-fixture',name:'虚构团队'}],expiresAt:now+600000}))
   mem.data.set('session.coho',JSON.stringify({token:'fixture-coho',principal:'principal-fixture',label:'虚构',expiresAt:now+600000}))
-  let mutated=0;let total=0;let dayEnd='21:00'
+  let mutated=0;let total=0;let dayEnd='21:00';let missingPunches=false
   const fetcher:Fetcher=async(url,init={})=>{
     const path=new URL(String(url)).pathname
     if(path.endsWith('/users/me'))return json({uuid:'user-fixture'})
     if(path.endsWith('/info'))return json({timezone:'Asia/Shanghai',workhours_unit:'hour',configs:[{type:'manhour_mode',data:'simple'}]})
     if(path.endsWith('/getCurrentUser'))return json({code:200,data:{tenantCode:'ATS',globalId:'principal-fixture'}})
     if(path.endsWith('/getInfoByDateAndUser'))return json({code:200,data:{kqqsId:'period-fixture',kqqs:'period-label'}})
-    if(path.endsWith('/attCalendar'))return json({code:200,data:{dateList:[{date:'2026-01-05'}],dkList:attendance('09:00',dayEnd).punches}})
+    if(path.endsWith('/attCalendar'))return json({code:200,data:{dateList:[{date:'2026-01-05'}],dkList:missingPunches?[]:attendance('09:00',dayEnd).punches}})
     const {query}=JSON.parse(String(init.body))
     if(query.includes('mutation')){mutated++;throw Error('test must not write')}
     if(query.includes('PluginTask'))return json({data:{tasks:[{uuid:'task-fixture',number:1,name:'虚构任务',project:{uuid:'project-fixture',name:'项目'},issueType:{uuid:'type-fixture',name:'缺陷'},status:{uuid:'status-fixture',name:'待处理'}}]}})
@@ -118,7 +118,7 @@ test('TC-PLUGIN-003/004: service authority survives stale preview and refuses di
   assert.equal(preview.budget,600);assert.equal(preview.remaining,120)
   await assert.rejects(()=>service.submit(preview.id,true));assert.equal(mutated,0)
   // The test-only write gate exposes the real write-time revalidation, without a mutation.
-  const verified=new Workbench({...deps,writesVerified:true})
+  const verified=new Workbench({...deps,worklogWritesEnabled:true})
   const day2=await verified.readDay(input);const preview2=await verified.makePreview({dayId:day2.id,selection:selected,allocations:[row]})
   total=300000
   await assert.rejects(()=>verified.submit(preview2.id,true));assert.equal(mutated,0)
@@ -126,6 +126,17 @@ test('TC-PLUGIN-003/004: service authority survives stale preview and refuses di
   const day3=await verified.readDay(input);const preview3=await verified.makePreview({dayId:day3.id,selection:selected,allocations:[row]})
   dayEnd='20:00'
   await assert.rejects(()=>verified.submit(preview3.id,true));assert.equal(mutated,0)
+  missingPunches=true;total=50000
+  const manualDay=await verified.readDay(input)
+  assert.equal(manualDay.attendance.punches.length,0)
+  await assert.rejects(()=>verified.makePreview({dayId:manualDay.id,selection:selected,allocations:[row]}))
+  const manual={mode:'manual' as const,minutes:480,confirmed:true}
+  await assert.rejects(()=>verified.makePreview({dayId:manualDay.id,selection:{...manual,confirmed:false},allocations:[row]}))
+  await assert.rejects(()=>verified.makePreview({dayId:manualDay.id,selection:manual,allocations:[row]}))
+  const manualPreview=await verified.makePreview({dayId:manualDay.id,selection:manual,allocations:[{...row,minutes:450}]})
+  assert.equal(manualPreview.basis,'manual');assert.equal(manualPreview.budget,480);assert.equal(manualPreview.remaining,0)
+  total=100000
+  await assert.rejects(()=>verified.submit(manualPreview.id,true));assert.equal(mutated,0)
   await service.logout('coho')
   await assert.rejects(()=>service.readDay(input));assert.equal((await service.status()).ones.connected,true)
 })
@@ -149,7 +160,7 @@ test('TC-PLUGIN-001-cancel: cancelled login cannot revive a stored session', asy
   assert.equal(await mem.vault.get('session.coho'),null)
 })
 
-test('TC-PLUGIN-004-positive: confirmed synthetic batch writes and reads each original date', async () => {
+for (const manual of [false, true]) test(`TC-PLUGIN-004-positive: confirmed synthetic batch writes and reads each original date${manual ? ' with manual missing-punch duration' : ''}`, async () => {
   const mem=memory();const until=Date.now()+600000
   mem.data.set('session.ones',JSON.stringify({token:'fixture-access',userId:'user-fixture',label:'虚构',teams:[{id:'team-fixture',name:'虚构团队'}],expiresAt:until}))
   mem.data.set('session.coho',JSON.stringify({token:'fixture-coho',principal:'principal-fixture',label:'虚构',expiresAt:until}))
@@ -160,21 +171,23 @@ test('TC-PLUGIN-004-positive: confirmed synthetic batch writes and reads each or
     if(path.endsWith('/info'))return json({timezone:'Asia/Shanghai',workhours_unit:'hour',configs:[{type:'manhour_mode',data:'simple'}]})
     if(path.endsWith('/getCurrentUser'))return json({code:200,data:{tenantCode:'ATS',globalId:'principal-fixture'}})
     if(path.endsWith('/getInfoByDateAndUser'))return json({code:200,data:{kqqsId:'period-fixture',kqqs:'period-label'}})
-    if(path.endsWith('/attCalendar'))return json({code:200,data:{dateList:[{date:'2026-01-05'}],dkList:attendance().punches}})
+    if(path.endsWith('/attCalendar'))return json({code:200,data:{dateList:[{date:'2026-01-05'}],dkList:manual?attendance().punches.slice(0,1):attendance().punches}})
     const {query,variables:v}=JSON.parse(String(init.body))
     if(query.includes('PluginAdd')){
       writes++;const key=`log-${writes}`;logs.push({key,hours:v.hours,startTime:v.start_time,type:v.type,description:v.description,owner:{uuid:v.owner},task:{uuid:v.task}})
       return json({data:{addManhour:{key}}})
     }
     if(query.includes('PluginReadback'))return json({data:{manhours:logs.filter(r=>r.key===v.filter.key_equal)}})
-    if(query.includes('PluginTask'))return json({data:{tasks:[{uuid:'task-fixture',number:1,name:'虚构任务',project:{uuid:'project-fixture',name:'项目'},issueType:{uuid:'type-fixture',name:'缺陷'},status:{uuid:'status-fixture',name:'待处理'}}]}})
+    if(query.includes('PluginTask'))return json({data:{tasks:[{uuid:v.filter.uuid_equal,number:1,name:'虚构任务',project:{uuid:'project-fixture',name:'项目'},issueType:{uuid:'type-fixture',name:v.filter.uuid_equal==='bug-fixture'?'缺陷':'任务'},status:{uuid:'status-fixture',name:'待处理'}}]}})
     return json({data:{buckets:[{manhours:logs,pageInfo:{hasNextPage:false,endCursor:'',unstable:false}}]}})
   }
-  const service=new Workbench({store:mem.store,vault:mem.vault,protection:async()=>true,fetcher,writesVerified:true})
+  const service=new Workbench({store:mem.store,vault:mem.vault,protection:async()=>true,fetcher,worklogWritesEnabled:true})
   const day=await service.readDay({team:'team-fixture',date:'2026-01-05',mappingConfirmed:true})
-  const preview=await service.makePreview({dayId:day.id,selection:selected,allocations:[row,{...row,minutes:120,start:'19:00',description:'另一条虚构描述'}]})
+  const preview=await service.makePreview({dayId:day.id,selection:manual?{mode:'manual',minutes:600,confirmed:true}:selected,allocations:[row,{...row,taskId:'bug-fixture',minutes:120,start:'19:00',description:'另一条虚构描述'}]})
+  assert.equal(preview.basis,manual?'manual':'punches')
   assert.deepEqual(await service.submit(preview.id,true),{count:2})
   assert.equal(writes,2)
+  assert.deepEqual(logs.map(r => (r.task as { uuid: string }).uuid), ['task-fixture', 'bug-fixture'])
   assert.equal(logs[0].startTime,startSeconds('2026-01-05','09:00'))
   assert.equal(logs[1].startTime,startSeconds('2026-01-05','19:00'))
   assert.equal((await mem.store.get('receipts') as Receipt[]).filter(r=>r.state==='verified').length,2)

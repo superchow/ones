@@ -1,13 +1,30 @@
 export type Site = 'ones' | 'coho'
-export type Connection = { connected: boolean; label: string }
+export type Connection = { connected: boolean; label: string; profileKey?: string; message?: string }
 export type Option = { id: string; name: string }
-export type Task = { id: string; number: number; name: string; project: Option; issueType: Option; status: Option }
+export type Task = { id: string; number: number; name: string; project: Option; issueType: Option; status: Option; sprint?: Option | null }
+export type TaskFilter = { projectId?: string; sprintId?: string; onlyMine?: boolean }
 export type TaskPage = { items: Task[]; nextCursor: string | null }
 export type Punch = { date: string; realDate: string; time: string; isNext: boolean; outFence: boolean | null }
 export type Attendance = { date: string; punches: Punch[]; fetchedAt: number }
+export type AttendanceSelection = { mode?: 'punches'; start: number; end: number; confirmed: boolean } | { mode: 'manual'; minutes: number; confirmed: boolean }
 export type Worklog = { key: string; task: string; owner: string; hours: number; startTime: number; description: string; type: string }
-export type Allocation = { taskId: string; start: string; minutes: number; description: string }
-export type Preview = { id: string; date: string; budget: number; existing: number; proposed: number; remaining: number; rows: (Allocation & { taskName: string })[]; expiresAt: number }
+export type NewTaskDraft = { key: string; title: string; projectId: string; sprintId: string; fields: Record<string, string> }
+export type Allocation = { taskId: string; newTask?: NewTaskDraft; start: string; minutes: number; description: string }
+export function validateAllocationTarget(value: unknown): void {
+  const row = record(value)
+  if (row.newTask === undefined) { id(row.taskId); return }
+  requireThat(row.taskId === '', 'input', '新任务建议不能同时关联现有任务。')
+  const draft = record(row.newTask)
+  id(draft.key)
+  requireThat(typeof draft.title === 'string' && draft.title.length <= 500, 'input', '新任务标题过长或格式无效。')
+  requireThat(typeof draft.projectId === 'string' && typeof draft.sprintId === 'string', 'input', '新任务项目或迭代无效。')
+  if (draft.projectId) id(draft.projectId)
+  if (draft.sprintId) id(draft.sprintId)
+  const fields = record(draft.fields)
+  requireThat(Object.keys(fields).length <= 50, 'input', '新任务字段过多。')
+  for (const [key, value] of Object.entries(fields)) { id(key); requireThat(typeof value === 'string' && value.length <= 2000, 'input', '新任务字段格式无效。') }
+}
+export type Preview = { id: string; date: string; budget: number; existing: number; proposed: number; remaining: number; rows: (Allocation & { taskName: string; creationDetails?: string[] })[]; expiresAt: number; basis?: 'punches' | 'manual' }
 export type Status = { ones: Connection; coho: Connection; teams: Option[]; writeEnabled: boolean; blockers: string[] }
 export class AppError extends Error {
   constructor(public code: string, message: string) { super(message); this.name = 'AppError' }

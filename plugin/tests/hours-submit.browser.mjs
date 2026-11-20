@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict'
+
+export async function exerciseHoursSubmitFailure({ evaluate, wait }) {
+  await wait(`!!document.querySelector('.date-trigger')&&!app.busy`)
+  const click = label => evaluate(`[...document.querySelectorAll('button')].find(b=>b.textContent===${JSON.stringify(label)}).click()`)
+  const check = label => evaluate(`[...document.querySelectorAll('label')].find(e=>e.textContent===${JSON.stringify(label)}).querySelector('input').click()`)
+  await check('已确认 ONES 与 Coho 均为本人账号')
+  await click('读取考勤与已有工时')
+  await wait(`!!document.getElementById('上班打卡')&&!app.busy`)
+  await check('已核对本人当日上下班记录，无缺卡、跨日或外勤异常')
+  await evaluate(`(()=>{app.status.writeEnabled=true;fixture.submitError='worklog-preflight';app.hours.allocations=[{taskId:'',newTask:{key:'manual',title:'人工修改的任务',projectId:'other-project',sprintId:'other-project-next',fields:{due:'2026-11-15'}},start:'09:30',minutes:90,description:'人工核对后的实际工作内容'}];app.render()})()`)
+  const draft = await evaluate(`JSON.stringify(app.hours.allocations)`)
+  await click('校验并预览')
+  await wait(`document.body.innerText.includes('提交预览')&&!app.busy`)
+  await check('我确认上述任务、原日期、时长和每笔描述')
+  await click('确认提交到 ONES')
+  await wait(`document.body.innerText.includes('已保留全部调整')&&!app.busy`)
+  assert.equal(await evaluate(`JSON.stringify(app.hours.allocations)`), draft)
+  assert.equal(await evaluate(`!!app.hours.day`), true)
+  assert.equal(await evaluate(`!!app.hours.preview`), false)
+  assert.equal(await evaluate(`app.hours.confirmed`), false)
+  await click('校验并预览')
+  await wait(`document.body.innerText.includes('提交预览')&&!app.busy`)
+  await evaluate(`fixture.submitError='worklog-partial'`)
+  await check('我确认上述任务、原日期、时长和每笔描述')
+  await click('确认提交到 ONES')
+  await wait(`document.body.innerText.includes('本批草稿已清空')&&!app.busy`)
+  assert.equal(await evaluate(`app.hours.allocations.length`), 0)
+  assert.equal(await evaluate(`!!app.hours.day`), false)
+  return { manualEditsRetainedOnPreflight: true, canPreviewAgain: true, uncertainWriteStillRequiresReconciliation: true, realWrites: 0 }
+}

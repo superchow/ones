@@ -1,4 +1,4 @@
-import { AppError, id, record, requireThat, text, type Task, type TaskPage, type Worklog } from '../domain/model.ts'
+import { AppError, id, record, requireThat, text, type Option, type TaskFilter, type Task, type TaskPage, type Worklog } from '../domain/model.ts'
 import { Transport, jsonBody } from './http.ts'
 import type { OnesSession } from './ones-auth.ts'
 import { BugDetailsReader } from './bug-details.ts'
@@ -25,6 +25,9 @@ export class OnesClient {
     requireThat(session.teams.some(t => t.id === team), 'identity', '所选团队不属于当前登录身份。')
   }
   private get base() { return `/project/api/project/team/${this.team}` }
+  api(path: string, body?: Record<string, unknown>, signal?: AbortSignal) {
+    return this.transport.json(this.base + path, { ...(body ? jsonBody(body, this.session.token) : { headers: { Authorization: `Bearer ${this.session.token}` } }), signal })
+  }
   async assertIdentity(signal?: AbortSignal): Promise<void> {
     const user = await this.transport.json('/project/api/project/users/me', { headers: { Authorization: `Bearer ${this.session.token}` }, signal })
     requireThat(user.uuid === this.session.userId, 'identity', '当前 ONES 身份已变化。')
@@ -104,18 +107,50 @@ export class OnesClient {
     requireThat(new Set(statuses.map(status => status.id)).size === statuses.length, 'schema', '状态配置存在重复身份，请重新读取。')
     return statuses
   }
-  async tasks(after = '', signal?: AbortSignal): Promise<TaskPage> {
-    return this.assignedTaskPage(after, signal)
+  async projects(signal?: AbortSignal): Promise<Option[]> {
+    const data = await this.graph('query PluginProjects($filters: [Filter!]){buckets(groupBy:{projects:{}},pagination:{limit:50,after:"",preciseCount:true}){projects(limit:2001,filterGroup:$filters){uuid name} pageInfo{hasNextPage}}}', { filters: [{ visibleInProject_equal: true, isArchive_equal: false }] }, 'Task', signal)
+    requireThat(Array.isArray(data.buckets) && data.buckets.length <= 1, 'partial', '项目列表不完整，请重试。')
+    if (!data.buckets.length) return []
+    const bucket = record(data.buckets[0])
+    requireThat(Array.isArray(bucket.projects) && bucket.projects.length <= 2000 && record(bucket.pageInfo).hasNextPage === false, 'partial', '项目列表超过读取范围，不能展示不完整结果。')
+    const projects = bucket.projects.map(option)
+    requireThat(new Set(projects.map(p => p.id)).size === projects.length, 'partial', '项目列表包含重复项目。')
+    return projects
   }
-  private async assignedTaskPage(after: string, signal?: AbortSignal, issueTypeId?: string): Promise<TaskPage> {
+  async iterations(projectId: string, signal?: AbortSignal): Promise<Option[]> {
+    const project = id(projectId)
+    const data = await this.graph('query PluginIterations($filters: [Filter!]){sprints(filterGroup:$filters,orderBy:{namePinyin:ASC,createTime:ASC}){uuid name project{uuid}}}', { filters: [{ project_in: [project], visibleInProject_equal: true }] }, 'Task', signal)
+    requireThat(Array.isArray(data.sprints) && data.sprints.length <= 2000, 'partial', '迭代列表不完整。')
+    const iterations = data.sprints.map(value => {
+      const sprint = record(value)
+      requireThat(record(sprint.project).uuid === project, 'scope', '迭代不属于所选项目。')
+      return option(sprint)
+    })
+    requireThat(new Set(iterations.map(s => s.id)).size === iterations.length, 'partial', '迭代列表包含重复迭代。')
+    return iterations
+  }
+  async tasks(after = '', signal?: AbortSignal, filter: TaskFilter = {}): Promise<TaskPage> {
+    requireThat(!filter.sprintId || filter.projectId, 'input', '请先选择迭代所属项目。')
+    requireThat(filter.onlyMine === undefined || typeof filter.onlyMine === 'boolean', 'input', '负责人范围无效。')
+    return this.assignedTaskPage(after, signal, undefined, filter)
+  }
+  private async assignedTaskPage(after: string, signal?: AbortSignal, issueTypeId?: string, filter: TaskFilter = {}): Promise<TaskPage> {
     requireThat(typeof after === 'string' && after.length <= 8192, 'input', '分页游标格式无效。')
-    const query = `query PluginTaskPage($filter: Filter){buckets(groupBy:{tasks:{}},pagination:{limit:50,after:${JSON.stringify(after)},preciseCount:true}){tasks(filter:$filter,orderBy:{serverUpdateStamp:DESC}){${TASK_FIELDS}} pageInfo{hasNextPage endCursor unstable}}}`
-    const data = await this.graph(query, { filter: { assign_in: [this.session.userId], ...(issueTypeId ? { issueType_in: [issueTypeId] } : {}) } }, 'Task', signal)
+    const query = `query PluginTaskPage($filter: Filter){buckets(groupBy:{tasks:{}},pagination:{limit:50,after:${JSON.stringify(after)},preciseCount:true}){tasks(filter:$filter,orderBy:{serverUpdateStamp:DESC}){${TASK_FIELDS}${filter.projectId ? ' sprint{uuid name}' : ''}} pageInfo{hasNextPage endCursor unstable}}}`
+    const data = await this.graph(query, { filter: { ...(!filter.projectId || filter.onlyMine !== false ? { assign_in: [this.session.userId] } : {}), ...(issueTypeId ? { issueType_in: [issueTypeId] } : {}), ...(filter.projectId ? { project_in: [id(filter.projectId)] } : {}), ...(filter.sprintId ? { sprint_in: [id(filter.sprintId)] } : {}) } }, 'Task', signal)
     requireThat(Array.isArray(data.buckets) && data.buckets.length === 1, 'partial', '任务分页响应不完整。')
     const bucket = record(data.buckets[0])
     const meta = record(bucket.pageInfo)
     requireThat(Array.isArray(bucket.tasks) && meta.unstable === false && typeof meta.hasNextPage === 'boolean', 'partial', '任务分页不稳定，请重新读取。')
-    const items = bucket.tasks.map(parseTask)
+    const items = bucket.tasks.map(value => {
+      const task = parseTask(value)
+      if (filter.projectId) {
+        const sprint = record(value).sprint
+        task.sprint = sprint ? option(sprint) : null
+        requireThat(task.project.id === filter.projectId && (!filter.sprintId || task.sprint?.id === filter.sprintId), 'scope', '任务不属于所选项目或迭代，请重新读取。')
+      }
+      return task
+    })
     requireThat(!issueTypeId || items.every(task => task.issueType.id === issueTypeId), 'scope', '服务端返回非缺陷工作项，已停止展示。')
     requireThat(new Set(items.map(task => task.id)).size === items.length, 'partial', '任务分页存在重复身份。')
     const nextCursor = meta.hasNextPage ? text(meta.endCursor, 8192) : null
@@ -141,7 +176,7 @@ export class OnesClient {
   }
 }
 
-// Kept separate from reads. Production handlers gate access until end-to-end write validation.
+// Kept separate from reads. Service handlers require attendance, preview, confirmation and receipts.
 export function worklogWriter(client: OnesClient) {
   return {
     async add(intent: import('../domain/submission.ts').WriteIntent): Promise<string> {

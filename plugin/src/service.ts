@@ -1,31 +1,35 @@
 import { OnesTransitions } from './adapters/ones-transitions.ts'
 import { filterProject, projectMappingKey, type ProjectMapping } from './domain/project-mapping.ts'
-import type { Option } from './domain/model.ts'
+import type { Option, TaskFilter } from './domain/model.ts'
 import { createHash, randomUUID } from 'node:crypto'
-import { type Allocation, type Attendance, type Preview, type Site, type Status, type Worklog, AppError, id, record, requireThat, text, validDate } from './domain/model.ts'
+import { type Allocation, type Attendance, type Preview, type Site, type Status, type Worklog, AppError, id, record, requireThat, safeFailure, text, validDate, validateAllocationTarget } from './domain/model.ts'
 import { apiHours, attendanceBudget, checkAllocations, existingMinutes, startSeconds, validateDescription } from './domain/attendance.ts'
 import { Submission, assertNoPending, createReceipt, parseReceipts, protectedDayHash, receiptCandidates, type Ledger, type Receipt } from './domain/submission.ts'
 import { type Day, type DayInput, type Draft, type ImplementationBrief, type LoginInput, type PreviewInput, type PendingWrite, type RecoveryPreview } from './protocol.ts'
 import { COHO, ONES, Transport, type Fetcher } from './adapters/http.ts'
-import { loginOnes, type OnesSession } from './adapters/ones-auth.ts'
-import { CohoClient, loginCoho, type CohoSession } from './adapters/coho.ts'
+import { loginOnes, refreshOnes, validateOnes, type OnesSession } from './adapters/ones-auth.ts'
+import { CohoClient, loginCoho, validateCoho, type CohoSession } from './adapters/coho.ts'
 import { OnesClient, worklogWriter } from './adapters/ones.ts'
+import { TaskCreator, taskCreationSignature, type TaskCreationPlan } from './adapters/task-creation.ts'
 import { BugMediaStore } from './adapters/bug-media.ts'
 import { assertDetailFits, type BugDetail, type Discussion, type Attachment, type DetailPage } from './adapters/bug-details.ts'
 import { allPages, mediaIds, type CompleteBug } from './domain/repair-content.ts'
 import type { BugContent } from './domain/bug-content.ts'
 export interface Store { get(key: string): Promise<unknown>; set(key: string, value: unknown): Promise<void>; delete(key: string): Promise<void> }
 export interface Vault { get(key: string): Promise<string | null>; set(key: string, value: string): Promise<void>; delete(key: string): Promise<void> }
-export interface Dependencies { store: Store; vault: Vault; protection(): Promise<boolean>; fetcher?: Fetcher; writesVerified?: boolean }
+export interface Dependencies { store: Store; vault: Vault; protection(): Promise<boolean>; fetcher?: Fetcher; worklogWritesEnabled?: boolean }
 type Snapshot = { input: DayInput; data: Day; identity: string; stamp: string }
-type Confirmation = { view: Preview; snapshot: Snapshot; input: PreviewInput; identity: string }
+type Confirmation = { view: Preview; snapshot: Snapshot; input: PreviewInput; identity: string; creations: Map<string, TaskCreationPlan> }
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 
 export class Workbench {
   private sessions: { ones?: OnesSession; coho?: CohoSession } = {}
   private epochs = { ones: 0, coho: 0 }
   private authQueues: Record<Site, Promise<unknown>> = { ones: Promise.resolve(), coho: Promise.resolve() }
-  private ready: Promise<void>
+  private ready?: Promise<void>
+  private renewing: Partial<Record<Site, { epoch: number; promise: Promise<void> }>> = {}
+  private connectionNotes: Partial<Record<Site, string>> = {}
+  private unreadableSessions = new Set<Site>()
   private day?: Snapshot
   private preview?: Confirmation
   private recovery?: { id: string; receiptId: string; team: string; identity: string; key: string; stamp: string; expiresAt: number }
@@ -38,22 +42,82 @@ export class Workbench {
   constructor(private deps: Dependencies) {
     this.onesTransport = new Transport(ONES, deps.fetcher)
     this.cohoTransport = new Transport(COHO, deps.fetcher)
-    this.ready = this.restore()
+  }
+  private async ensureReady(): Promise<void> {
+    this.ready ??= this.restore().catch(error => {
+      this.ready = undefined
+      throw error
+    })
+    await this.ready
+    // Share the initial restore, but allow a later request to retry a locked vault.
+    if (this.unreadableSessions.size) this.ready = undefined
   }
   private async restore(): Promise<void> {
     for (const site of ['ones', 'coho'] as const) {
-      const raw = await this.deps.vault.get(`session.${site}`)
-      if (!raw) continue
+      if (this.sessions[site]) continue
+      const epoch = this.epochs[site]
       try {
+        const raw = await this.deps.vault.get(`session.${site}`)
+        if (epoch !== this.epochs[site]) continue
+        this.unreadableSessions.delete(site)
+        delete this.connectionNotes[site]
+        if (!raw) continue
         const stored = record(JSON.parse(raw)); text(stored.token, 16000); text(stored.label)
-        requireThat(typeof stored.expiresAt === 'number' && stored.expiresAt > Date.now(), 'auth', '保存的登录已过期。')
+        requireThat((site === 'coho' && stored.expiresAt === null) || (typeof stored.expiresAt === 'number' && Number.isFinite(stored.expiresAt)), 'schema', '保存的登录格式无效。')
         if (site === 'ones') {
+          if (stored.refreshToken !== undefined) text(stored.refreshToken, 16000)
           id(stored.userId); requireThat(Array.isArray(stored.teams), 'schema', '团队信息无效。')
           stored.teams.forEach(t => { id(record(t).id); text(record(t).name) })
           this.sessions.ones = stored as unknown as OnesSession
         } else { id(stored.principal); this.sessions.coho = stored as unknown as CohoSession }
-      } catch { await this.deps.vault.delete(`session.${site}`) }
+      } catch {
+        if (epoch !== this.epochs[site]) continue
+        this.unreadableSessions.add(site)
+        this.connectionNotes[site] = '保存的登录暂时无法读取，凭证未删除；可刷新重试或重新登录。'
+      }
     }
+  }
+  private async ensureSession(site: Site): Promise<void> {
+    const previous = this.sessions[site], epoch = this.epochs[site]
+    if (!previous || ((previous.expiresAt === null || previous.expiresAt > Date.now()) && !(site === 'ones' && this.sessions.ones?.needsValidation))) return
+    if (this.renewing[site]?.epoch === epoch) return this.renewing[site]!.promise
+    const promise = this.queue(site, async () => {
+      if (this.epochs[site] !== epoch || this.sessions[site] !== previous) return
+      const current = () => requireThat(this.epochs[site] === epoch, 'cancelled', '登录状态已变化。')
+      const save = async (session: OnesSession | CohoSession) => {
+        current()
+        await this.deps.vault.set(`session.${site}`, JSON.stringify(session))
+        current()
+        if (site === 'ones') this.sessions.ones = session as OnesSession
+        else this.sessions.coho = session as CohoSession
+      }
+      try {
+        requireThat(await this.deps.protection(), 'secrets', '系统凭证库暂不可用，原登录未删除。')
+        if (site === 'ones') {
+          let session = previous as OnesSession
+          if (!session.needsValidation && session.refreshToken) {
+            session = await refreshOnes(this.onesTransport, session)
+            current(); this.closeDetail()
+            this.sessions.ones = session
+            // Persist rotation before identity reads: a temporary network failure
+            // must not lose the only usable replacement refresh token.
+            await save(session)
+          }
+          await save(await validateOnes(this.onesTransport, session))
+        } else await save(await validateCoho(this.cohoTransport, previous as CohoSession))
+        delete this.connectionNotes[site]
+      } catch (error) {
+        if (this.epochs[site] !== epoch) throw error
+        if (error instanceof AppError && ['auth', 'identity'].includes(error.code)) {
+          ++this.epochs[site]; delete this.sessions[site]; this.invalidate()
+          await this.deps.vault.delete(`session.${site}`)
+          this.connectionNotes[site] = '服务端确认登录已失效，请重新登录。'
+        } else this.connectionNotes[site] = '登录恢复暂未完成，凭证已保留；请检查连接后刷新重试。'
+        throw error
+      }
+    })
+    this.renewing[site] = { epoch, promise }
+    try { await promise } finally { if (this.renewing[site]?.promise === promise) delete this.renewing[site] }
   }
   private queue<T>(site: Site, action: () => Promise<T>): Promise<T> {
     const next = this.authQueues[site].then(action, action)
@@ -65,27 +129,33 @@ export class Workbench {
     return digest([this.sessions.ones?.userId, this.sessions.coho?.principal, this.epochs.ones, this.epochs.coho])
   }
   async status(): Promise<Status> {
-    await this.ready
+    await this.ensureReady()
+    await Promise.allSettled((['ones', 'coho'] as const).map(site => this.ensureSession(site)))
     const ones = this.sessions.ones; const coho = this.sessions.coho
-    return { ones: { connected: !!ones && ones.expiresAt > Date.now(), label: ones?.label ?? '未登录' }, coho: { connected: !!coho && coho.expiresAt > Date.now(), label: coho?.label ?? '未登录' }, teams: ones?.teams ?? [], writeEnabled: this.deps.writesVerified === true, blockers: ['工时写入尚待插件端到端验证，当前仅开放预览。', 'Coho 外勤标志与考勤异常规则仍需实例验证。', '执行修复通过 CLI 在已有项目创建聊天；媒体是本地引用，不能直接打开指定 session。', 'Bug 创建与内容修改尚未开放；状态更新按详情中的独立能力闸与字段配置校验，工时写闸不受影响。'] }
+    return { ones: { connected: !!ones && ones.expiresAt > Date.now() && !ones.needsValidation, label: ones?.label ?? '未登录', ...(ones ? { profileKey: digest([ONES, ones.userId]) } : {}), ...(this.connectionNotes.ones ? { message: this.connectionNotes.ones } : {}) }, coho: { connected: !!coho && (coho.expiresAt === null || coho.expiresAt > Date.now()), label: coho?.label ?? '未登录', ...(this.connectionNotes.coho ? { message: this.connectionNotes.coho } : {}) }, teams: ones?.teams ?? [], writeEnabled: this.deps.worklogWritesEnabled === true, blockers: [...(this.deps.worklogWritesEnabled ? [] : ['工时提交未启用，当前仅开放预览。']), '执行修复通过 CLI 在已有项目创建聊天；媒体是本地引用，不能直接打开指定 session。', 'Bug 创建与内容修改尚未开放；状态更新按详情中的独立能力闸与字段配置校验，工时独立预览确认。'] }
   }
   async login(input: LoginInput, signal?: AbortSignal): Promise<Status> {
-    await this.ready
+    await this.ensureReady()
     requireThat(input.site === 'ones' || input.site === 'coho', 'input', '登录站点无效。')
     const site = input.site; const epoch = ++this.epochs[site]
-    this.invalidate(); delete this.sessions[site]
+    this.unreadableSessions.delete(site)
+    delete this.connectionNotes[site]
+    this.invalidate()
     const account = text(input.account, 254).trim(); let password = text(input.password, 256)
     try {
-      await this.queue(site, () => this.deps.vault.delete(`session.${site}`))
       requireThat(await this.deps.protection(), 'secrets', '系统安全凭证存储不可用，未发送密码。')
       const session = site === 'ones' ? await loginOnes(this.onesTransport, account, password, input.httpAcknowledged, signal) : await loginCoho(this.cohoTransport, account, password, signal)
       await this.queue(site, async () => {
         requireThat(this.epochs[site] === epoch && !signal?.aborted, 'cancelled', '登录已取消或身份已切换。')
+        const previous = await this.deps.vault.get(`session.${site}`)
         await this.deps.vault.set(`session.${site}`, JSON.stringify(session))
         if (this.epochs[site] !== epoch || signal?.aborted) {
-          await this.deps.vault.delete(`session.${site}`)
+          if (previous === null) await this.deps.vault.delete(`session.${site}`)
+          else await this.deps.vault.set(`session.${site}`, previous)
           throw new AppError('cancelled', '登录已取消，未保留该次令牌。')
         }
+        ++this.epochs[site]
+        this.invalidate()
         if (site === 'ones') this.sessions.ones = session as OnesSession
         else this.sessions.coho = session as CohoSession
       })
@@ -93,30 +163,43 @@ export class Workbench {
     } finally { password = ''; input.password = '' }
   }
   async logout(site: Site): Promise<Status> {
-    await this.ready
+    await this.ensureReady()
     requireThat(site === 'ones' || site === 'coho', 'input', '站点无效。')
     ++this.epochs[site]; delete this.sessions[site]; this.invalidate()
+    this.unreadableSessions.delete(site)
+    delete this.connectionNotes[site]
     await this.queue(site, () => this.deps.vault.delete(`session.${site}`))
     return this.status()
   }
   private ones(team: string): OnesClient {
     const session = this.sessions.ones
-    requireThat(session && session.expiresAt > Date.now(), 'auth', '请先登录 ONES。')
+    requireThat(session && session.expiresAt > Date.now() && !session.needsValidation, 'auth', '请先登录 ONES。')
     return new OnesClient(this.onesTransport, session, team)
   }
   private coho(): CohoClient {
     const session = this.sessions.coho
-    requireThat(session && session.expiresAt > Date.now(), 'auth', '请先登录 Coho，工时必须基于考勤。')
+    requireThat(session && (session.expiresAt === null || session.expiresAt > Date.now()), 'auth', '请先登录 Coho，工时必须基于考勤。')
     return new CohoClient(this.cohoTransport, session)
   }
-  private async authenticated<T>(site: Site, action: () => Promise<T>): Promise<T> {
+  private async authenticated<T>(site: Site, action: () => Promise<T>, session = this.sessions[site]): Promise<T> {
+    const epoch = this.epochs[site]
     try { return await action() } catch (error) {
-      if (error instanceof AppError && error.code === 'auth') await this.logout(site)
+      if (error instanceof AppError && error.code === 'auth') {
+        await this.queue(site, async () => {
+          if (this.epochs[site] !== epoch || this.sessions[site] !== session) return
+          ++this.epochs[site]
+          delete this.sessions[site]
+          this.unreadableSessions.delete(site)
+          this.invalidate()
+          await this.deps.vault.delete(`session.${site}`)
+          this.connectionNotes[site] = '服务端确认登录已失效，请重新登录。'
+        })
+      }
       throw error
     }
   }
   async bugStatuses(team: string, signal?: AbortSignal) {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     return this.authenticated('ones', async () => {
       const identity = this.identity()
       const client = this.ones(team)
@@ -127,7 +210,7 @@ export class Workbench {
     })
   }
   async bugs(team: string, after = '', signal?: AbortSignal) {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     return this.authenticated('ones', async () => {
       const identity = this.identity()
       const client = this.ones(team)
@@ -137,12 +220,28 @@ export class Workbench {
       return bugs
     })
   }
-  async tasks(team: string, after = '', signal?: AbortSignal) {
-    await this.ready
+  async projects(team: string, signal?: AbortSignal) {
+    return this.taskOptions(team, client => client.projects(signal), signal)
+  }
+  async iterations(team: string, projectId: string, signal?: AbortSignal) {
+    return this.taskOptions(team, client => client.iterations(projectId, signal), signal)
+  }
+  private async taskOptions(team: string, read: (client: OnesClient) => Promise<Option[]>, signal?: AbortSignal) {
+    await this.ensureReady(); await this.ensureSession('ones')
+    return this.authenticated('ones', async () => {
+      const identity = this.identity(), client = this.ones(team)
+      await client.assertIdentity(signal)
+      const options = await read(client)
+      requireThat(identity === this.identity(), 'stale', '读取期间账号已变化，请重新读取。')
+      return options
+    })
+  }
+  async tasks(team: string, after = '', signal?: AbortSignal, filter: TaskFilter = {}) {
+    await this.ensureReady(); await this.ensureSession('ones')
     return this.authenticated('ones', async () => {
       const identity = this.identity(); const client = this.ones(team)
       await client.assertIdentity(signal)
-      const tasks = await client.tasks(after, signal)
+      const tasks = await client.tasks(after, signal, filter)
       requireThat(identity === this.identity(), 'stale', '读取期间账号已变化，请重新读取。')
       return tasks
     })
@@ -158,7 +257,7 @@ export class Workbench {
     media.allow(content.flatMap(block => block.kind === 'media' ? [block.resourceId] : []))
   }
   async bugDetail(team: string, taskId: string, signal?: AbortSignal, requestId?: string): Promise<BugDetail & {detailId:string}> {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     this.closeDetail()
     if (requestId !== undefined) this.detailRequest = id(requestId)
     const epoch = this.detailEpoch
@@ -184,7 +283,7 @@ export class Workbench {
     })
   }
   async projectFilter(team: string, localProject: Option | null, projects: Option[]) {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     const client = this.ones(team), identity = this.identity()
     requireThat(Array.isArray(projects) && projects.length <= 2000, 'input', '项目筛选范围过大。')
     const candidates = projects.map(p => ({ id: id(p.id), name: text(p.name, 500) }))
@@ -203,7 +302,7 @@ export class Workbench {
   }
   /// 本地缓存只绑定仍有效的登录身份；首屏不联网，所有远端动作另外鉴权。
   async repairCacheContext(team: string, signal?: AbortSignal) {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     const identity = this.identity(), client = this.ones(team)
     const check = () => {
       signal?.throwIfAborted()
@@ -213,7 +312,7 @@ export class Workbench {
     return { scope: this.scope(client), check }
   }
   async repairListContext(team: string, signal?: AbortSignal) {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     const identity = this.identity(), client = this.ones(team)
     const check = () => {
       signal?.throwIfAborted()
@@ -240,7 +339,7 @@ export class Workbench {
   }
   /// 状态业务上下文固定在当前详情，关闭或切身份立即撤销未发送确认。
   async transitionContext(detailId: string) {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     const detail = this.currentDetail(detailId), client = this.ones(detail.team)
     await client.assertIdentity()
     const check = () => { requireThat(this.currentDetail(detailId) === detail, 'stale', '详情或身份已变化，请重新打开。') }
@@ -251,7 +350,7 @@ export class Workbench {
     return { scope: this.scope(client), task, adapter: new OnesTransitions(this.onesTransport, client.session, detail.team), check }
   }
   async repairContext(detailId: string) {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     const detail = this.currentDetail(detailId)
     const client = this.ones(detail.team)
     await client.assertIdentity()
@@ -259,7 +358,7 @@ export class Workbench {
     return { scope: this.scope(client), task: detail.view.task }
   }
   async collectRepair(detailId: string, signal?: AbortSignal) {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     const detail = this.currentDetail(detailId)
     const client = this.ones(detail.team)
     const check = () => {
@@ -298,7 +397,7 @@ export class Workbench {
     return detail
   }
   async detailComments(detailId: string, before: number | undefined, signal?: AbortSignal): Promise<DetailPage<Discussion>> {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     return this.authenticated('ones',async()=>{
       const detail = this.currentDetail(detailId)
       const client = this.ones(detail.team)
@@ -313,7 +412,7 @@ export class Workbench {
     })
   }
   async detailAttachments(detailId: string, before: number | undefined, signal?: AbortSignal): Promise<DetailPage<Attachment>> {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     return this.authenticated('ones',async()=>{
       const detail = this.currentDetail(detailId)
       const client = this.ones(detail.team)
@@ -328,7 +427,7 @@ export class Workbench {
     })
   }
   async detailMedia(detailId: string, resourceId: string, offset: number, signal?: AbortSignal) {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     return this.authenticated('ones',async()=>{
       const detail = this.currentDetail(detailId)
       const result = await detail.media.read(detailId,resourceId,offset,signal)
@@ -337,7 +436,7 @@ export class Workbench {
     })
   }
   async brief(team: string, taskId: string, signal?: AbortSignal): Promise<ImplementationBrief> {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     return this.authenticated('ones', async () => {
       const identity = this.identity(); const client = this.ones(team)
       await client.assertIdentity(signal); const task = await client.task(taskId, signal)
@@ -348,12 +447,13 @@ export class Workbench {
     })
   }
   private async fetchDay(input: DayInput, signal?: AbortSignal): Promise<Snapshot> {
+    await this.ensureSession('coho')
     requireThat(input.mappingConfirmed === true, 'identity', '请确认两站均为本人账号。')
     validDate(input.date)
     const identity = this.identity(); const ones = this.ones(input.team); const coho = this.coho()
-    await this.authenticated('ones', async () => { await ones.assertIdentity(signal); await ones.config(signal) })
-    const attendance = await this.authenticated('coho', () => coho.attendance(input.date, signal))
-    const worklogs = await this.authenticated('ones', () => ones.worklogs(input.date, signal))
+    await this.authenticated('ones', async () => { await ones.assertIdentity(signal); await ones.config(signal) }, ones.session)
+    const attendance = await this.authenticated('coho', () => coho.attendance(input.date, signal), coho.session)
+    const worklogs = await this.authenticated('ones', () => ones.worklogs(input.date, signal), ones.session)
     requireThat(identity === this.identity(), 'identity', '读取期间账号已变化，请重新读取。')
     const existing = existingMinutes(worklogs, input.date, ones.session.userId)
     const data = { id: randomUUID(), date: input.date, attendance, existing, worklogs }
@@ -362,33 +462,74 @@ export class Workbench {
     return { input: { ...input }, data, identity, stamp }
   }
   async readDay(input: DayInput, signal?: AbortSignal): Promise<Day> {
-    await this.ready; this.invalidate()
+    await this.ensureReady(); await this.ensureSession('ones'); this.invalidate()
     const snapshot = await this.fetchDay(input, signal)
     this.day = snapshot
     return snapshot.data
   }
   async makePreview(input: PreviewInput, signal?: AbortSignal): Promise<Preview> {
-    await this.ready
-    const snapshot = this.day
-    requireThat(snapshot && snapshot.data.id === input.dayId && snapshot.identity === this.identity() && Date.now() - snapshot.data.attendance.fetchedAt < 300000, 'stale', '考勤或身份已过期，请重新读取。')
+    await this.ensureReady(); await this.ensureSession('ones')
+    const snapshot = await this.currentDay(input.dayId, signal)
     const budget = attendanceBudget(snapshot.data.attendance, input.selection)
     const allocations = structuredClone(input.allocations)
     const proposed = checkAllocations(allocations, budget, snapshot.data.existing)
     const client = this.ones(snapshot.input.team)
-    const rows = []
+    const rows: Preview['rows'] = [], creations = new Map<string, TaskCreationPlan>()
+    const creator = new TaskCreator(client)
     for (const allocation of allocations) {
-      const task = await client.task(id(allocation.taskId), signal)
-      rows.push({ ...allocation, taskName: task.name })
+      if (allocation.newTask) {
+        requireThat(!allocation.taskId && !creations.has(allocation.newTask.key), 'input', '新任务建议标识重复或同时关联了现有任务。')
+        const plan = await creator.prepare(allocation.newTask, snapshot.input.date, signal)
+        creations.set(allocation.newTask.key, plan)
+        rows.push({ ...allocation, taskName: `将新建任务：${plan.payload.summary}`, creationDetails: plan.details })
+      } else {
+        const task = await client.task(id(allocation.taskId), signal)
+        rows.push({ ...allocation, taskName: task.name })
+      }
     }
     requireThat(this.day === snapshot && snapshot.identity === this.identity(), 'stale', '预览期间身份或考勤已变化。')
-    const view = { id: randomUUID(), date: snapshot.input.date, budget, existing: snapshot.data.existing, proposed, remaining: budget - snapshot.data.existing - proposed, rows, expiresAt: Date.now() + 300000 }
-    this.preview = { view, snapshot, input: structuredClone(input), identity: this.identity() }
+    const view: Preview = { id: randomUUID(), date: snapshot.input.date, budget, existing: snapshot.data.existing, proposed, remaining: budget - snapshot.data.existing - proposed, rows, expiresAt: Date.now() + 300000, basis: input.selection.mode === 'manual' ? 'manual' : 'punches' }
+    this.preview = { view, snapshot, input: structuredClone(input), identity: this.identity(), creations }
     return view
   }
+  async taskCreateOptions(team: string, projectId: string, date: string, signal?: AbortSignal) {
+    await this.ensureReady(); await this.ensureSession('ones')
+    return this.authenticated('ones', async () => {
+      const identity = this.identity(), client = this.ones(team)
+      await client.assertIdentity(signal)
+      const options = await new TaskCreator(client).options(projectId, date, signal)
+      requireThat(identity === this.identity(), 'stale', '读取期间账号已变化。')
+      return options
+    })
+  }
+  private async currentDay(dayId: string, signal?: AbortSignal): Promise<Snapshot> {
+    const snapshot = this.day
+    requireThat(snapshot && snapshot.data.id === dayId && snapshot.identity === this.identity(), 'stale', '考勤或身份已变化，请重新读取考勤并确认当日工时。')
+    if (Date.now() - snapshot.data.attendance.fetchedAt >= 300000) {
+      // AI analysis and manual review can outlive the read cache. Refresh evidence,
+      // preserving the confirmed snapshot ID only when all business fields match.
+      const fresh = await this.fetchDay(snapshot.input, signal)
+      requireThat(this.day === snapshot && snapshot.identity === this.identity(), 'stale', '刷新期间账号或所选日期已变化，请重新读取考勤。')
+      requireThat(fresh.stamp === snapshot.stamp, 'stale', '考勤或已登记工时已变化，请重新读取考勤、确认当日工时后重新计算；已有 AI 分析文件仍保留。')
+      snapshot.data = { ...fresh.data, id: snapshot.data.id }
+    }
+    return snapshot
+  }
+  async aiHoursContext(input: Pick<PreviewInput, 'dayId' | 'selection'>, signal?: AbortSignal) {
+    await this.ensureReady(); await this.ensureSession('ones'); await this.ensureSession('coho')
+    const snapshot = await this.currentDay(input.dayId, signal)
+    const budget = attendanceBudget(snapshot.data.attendance, input.selection)
+    const scope = this.scope(this.ones(snapshot.input.team))
+    const key = digest([scope, this.sessions.coho?.principal, snapshot.stamp, input.selection])
+    return { key, team: snapshot.input.team, date: snapshot.input.date, budget, existing: snapshot.data.existing,
+      remaining: budget - snapshot.data.existing, basis: input.selection.mode === 'manual' ? 'manual' : 'punches',
+      check: () => requireThat(this.day === snapshot && snapshot.identity === this.identity(), 'stale', '账号或考勤已变化，请重新读取。') }
+  }
   async submit(previewId: string, confirmed: boolean): Promise<{ count: number }> {
-    await this.ready
-    requireThat(this.deps.writesVerified === true, 'not_verified', '插件工时写入尚未完成端到端验证，当前禁止提交。')
+    await this.ensureReady(); await this.ensureSession('ones')
+    requireThat(this.deps.worklogWritesEnabled === true, 'not_enabled', '当前未启用工时提交。')
     requireThat(!this.writeBusy, 'busy', '另一个写入尚未结束。'); this.writeBusy = true
+    let count = 0, writeAttempted = false
     try {
       const confirmation = this.preview
       requireThat(confirmed === true && confirmation && confirmation.view.id === previewId && confirmation.identity === this.identity() && confirmation.view.expiresAt > Date.now(), 'stale', '请重新预览并确认工时。')
@@ -400,19 +541,39 @@ export class Workbench {
       checkAllocations(confirmation.input.allocations, budget, fresh.data.existing)
       const scope = digest([ONES, client.team, client.session.userId])
       const ledger = this.ledger()
+      assertNoPending(await ledger.load(), scope)
+      const creator = new TaskCreator(client)
+      for (const original of confirmation.creations.values()) {
+        const current = await creator.prepare(original.draft, fresh.input.date)
+        requireThat(taskCreationSignature(current.payload) === taskCreationSignature(original.payload), 'stale', '新任务实际创建内容发生变化，请重新预览确认。')
+      }
       const writer = new Submission(ledger, worklogWriter(client))
-      let count = 0
       for (const allocation of confirmation.input.allocations) {
         requireThat(this.identity() === confirmation.identity, 'identity', '身份发生变化，后续提交已停止。')
-        await client.task(allocation.taskId)
-        const rows = await client.worklogs(fresh.input.date)
+        let rows = await client.worklogs(fresh.input.date)
         checkAllocations([allocation], budget, existingMinutes(rows, fresh.input.date, client.session.userId))
-        const intent = { scope, date: fresh.input.date, task: allocation.taskId, owner: client.session.userId, hours: apiHours(allocation.minutes), startTime: startSeconds(fresh.input.date, allocation.start), description: allocation.description }
+        let taskId = allocation.taskId
+        if (allocation.newTask) {
+          writeAttempted = true
+          taskId = await creator.createOrRead(confirmation.creations.get(allocation.newTask.key)!, scope, fresh.input.date, this.deps.store, () => requireThat(this.identity() === confirmation.identity, 'identity', '账号已变化，创建已停止。'))
+        }
+        await client.task(taskId)
+        if (allocation.newTask) {
+          rows = await client.worklogs(fresh.input.date)
+          checkAllocations([allocation], budget, existingMinutes(rows, fresh.input.date, client.session.userId))
+        }
+        const intent = { scope, date: fresh.input.date, task: taskId, owner: client.session.userId, hours: apiHours(allocation.minutes), startTime: startSeconds(fresh.input.date, allocation.start), description: allocation.description }
         requireThat(this.identity() === confirmation.identity, 'identity', '提交前账号已变化，未发送本笔写入。')
+        writeAttempted = true
         await writer.add(intent, digest([previewId, count, intent]), rows); count++
       }
       this.invalidate()
       return { count }
+    } catch (error) {
+      this.preview = undefined
+      if (writeAttempted) throw new AppError('worklog-partial', `本批已有 ${count} 笔完成回读，其余未完成或结果待核实；请先查看工时记录及待核对提交，勿整批重发。${error instanceof AppError ? error.message : ''}`)
+      if (error instanceof AppError && ['auth', 'identity'].includes(error.code)) throw error
+      throw new AppError('worklog-preflight', safeFailure(error).message)
     } finally { this.writeBusy = false }
   }
   private ledger(): Ledger {
@@ -423,7 +584,7 @@ export class Workbench {
   }
   private scope(client: OnesClient): string { return digest([ONES, client.team, client.session.userId]) }
   async worklogs(team: string, date: string, signal?: AbortSignal): Promise<Worklog[]> {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     validDate(date)
     return this.authenticated('ones', async () => {
       const identity = this.identity()
@@ -436,7 +597,7 @@ export class Workbench {
     })
   }
   async pending(team: string): Promise<PendingWrite[]> {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     const client = this.ones(team)
     return (await this.ledger().load()).filter(row => row.scope === this.scope(client) && row.state !== 'verified').map(row => ({
       id: row.id, kind: row.kind, date: row.intent.date, minutes: row.intent.hours * 60 / 100000,
@@ -444,7 +605,7 @@ export class Workbench {
     }))
   }
   async previewRecovery(team: string, receiptId: string, signal?: AbortSignal): Promise<RecoveryPreview> {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     requireThat(!this.writeBusy, 'busy', '写入或核对仍在进行。')
     this.recovery = undefined
     const identity = this.identity()
@@ -461,7 +622,7 @@ export class Workbench {
     return { id: view.id, receiptId, matchCount: 1, candidate, message: '请核对该记录确属本次操作。确认只更新本地核对状态，不新增或修改 ONES 工时。' }
   }
   async confirmRecovery(previewId: string, confirmed: boolean): Promise<{ verified: true }> {
-    await this.ready
+    await this.ensureReady(); await this.ensureSession('ones')
     requireThat(confirmed === true && !this.writeBusy, 'confirmation', '请确认匹配记录属于本次操作。')
     const view = this.recovery
     requireThat(view && view.id === previewId && view.identity === this.identity() && view.expiresAt > Date.now(), 'stale', '核对预览已失效，请重新回读。')
@@ -484,8 +645,8 @@ export class Workbench {
     } finally { this.writeBusy = false }
   }
   async describe(input: { team: string; date: string; key: string; description: string; confirmed: boolean }) {
-    await this.ready
-    requireThat(this.deps.writesVerified === true, 'not_verified', '插件描述更新尚未完成端到端验证，当前禁止提交。')
+    await this.ensureReady(); await this.ensureSession('ones')
+    requireThat(this.deps.worklogWritesEnabled === true, 'not_enabled', '当前未启用工时描述更新。')
     requireThat(input.confirmed === true && !this.writeBusy, 'confirmation', '请确认更新且等待其它写入结束。')
     validateDescription(input.description)
     this.writeBusy = true
@@ -525,15 +686,15 @@ export class Workbench {
     } finally { this.writeBusy = false }
   }
   async saveDraft(draft: Draft): Promise<{ saved: true }> {
-    await this.ready
+    await this.ensureReady()
     requireThat(this.sessions.ones && this.sessions.coho, 'identity', '请先登录两站，草稿需要绑定本人身份。')
     validDate(draft.date); requireThat(Array.isArray(draft.allocations) && draft.allocations.length <= 20, 'input', '草稿最多 20 笔。')
-    for (const row of draft.allocations) { id(row.taskId); apiHours(row.minutes); text(row.description, 2000) }
+    for (const row of draft.allocations) { validateAllocationTarget(row); apiHours(row.minutes); text(row.description, 2000) }
     await this.deps.store.set('draft', { owner: digest([this.sessions.ones.userId, this.sessions.coho.principal]), value: draft })
     return { saved: true }
   }
   async loadDraft(): Promise<Draft | null> {
-    await this.ready
+    await this.ensureReady()
     if (!this.sessions.ones || !this.sessions.coho) return null
     const stored = await this.deps.store.get('draft'); if (stored === null) return null
     const raw = record(stored)
@@ -541,7 +702,7 @@ export class Workbench {
     this.invalidate() // restored data never carries confirmation or attendance authority
     const value = record(raw.value); validDate(value.date)
     requireThat(Array.isArray(value.allocations) && value.allocations.length <= 20, 'schema', '本机草稿格式无效。')
-    for (const entry of value.allocations) { const row = record(entry); id(row.taskId); apiHours(row.minutes as number); text(row.start, 5); text(row.description, 2000) }
+    for (const entry of value.allocations) { const row = record(entry); validateAllocationTarget(row); apiHours(row.minutes as number); text(row.start, 5); text(row.description, 2000) }
     return value as unknown as Draft
   }
 }

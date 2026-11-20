@@ -1,4 +1,11 @@
 import type { RepairActions } from './repair-actions.ts'
+import type { AiHoursInput, AiHoursJob, AiHoursResult } from './ai-hours.ts'
+import type { TaskCreateOptions } from './adapters/task-creation.ts'
+import type { Preferences, PreferenceChange } from './preferences.ts'
+import type { FolderPage, GitInput, GitReport } from './local-git.ts'
+import type { FolderSelection } from './native-folder-picker.ts'
+import type { GitProjects, GitProjectsChange } from './git-projects.ts'
+import type { TaskFilter } from './domain/model.ts'
 import type { RepairListItem } from './repair.ts'
 import type { CachedRepairs } from './repair-cache.ts'
 import type { StatusWorkflow, StatusPreview, StatusResult, BusinessInput, BusinessPreview, BusinessResult } from './status-update.ts'
@@ -6,18 +13,23 @@ import type { TransitionInput } from './adapters/ones-transitions.ts'
 import type { RepairPreparation, RepairRecord } from './repair.ts'
 import type { BugDetail, Discussion, Attachment, DetailPage } from './adapters/bug-details.ts'
 import type { MediaChunk } from './adapters/bug-media.ts'
-import type { Allocation, Attendance, Option, Preview, Site, Status, Task, TaskPage, Worklog } from './domain/model.ts'
+import type { Allocation, Attendance, AttendanceSelection, Option, Preview, Site, Status, Task, TaskPage, Worklog } from './domain/model.ts'
 export type Answer<T> = { ok: true; value: T } | { ok: false; error: { code: string; message: string } }
 export type LoginInput = { site: Site; account: string; password: string; httpAcknowledged: boolean }
 export type DayInput = { team: string; date: string; mappingConfirmed: boolean }
 export type Day = { id: string; date: string; attendance: Attendance; existing: number; worklogs: Worklog[] }
-export type PreviewInput = { dayId: string; selection: { start: number; end: number; confirmed: boolean }; allocations: Allocation[] }
+export type PreviewInput = { dayId: string; selection: AttendanceSelection; allocations: Allocation[] }
 export type Draft = { date: string; allocations: Allocation[] }
 export type PendingWrite = { id: string; kind: 'add' | 'describe'; date: string; minutes: number; state: 'submitting' | 'unknown'; hasKey: boolean }
 export type RecoveryPreview = { id: string | null; receiptId: string; matchCount: number; candidate: Worklog | null; message: string }
 export type ImplementationBrief = { task: Task; text: string; blockedReason: string }
 declare module 'orca' {
   interface PluginRequests {
+    'preferences.load': { output: Answer<Preferences> }
+    'preferences.update': { input: PreferenceChange; output: Answer<{ saved: true }> }
+    'credentials.load': { input: { site: Site }; output: Answer<string | null> }
+    'credentials.save': { input: { site: Site; password: string }; output: Answer<{ saved: true }> }
+    'credentials.delete': { input: { site: Site }; output: Answer<{ deleted: true }> }
     'bugs.transitionReconcile': { input: { detailId: string; operationId: string }; output: Answer<StatusResult> }
 
     'bugs.projectFilter': { input: { team: string; projects: Option[] }; output: Answer<{ localProject: Option | null; project: Option | null }> }
@@ -41,10 +53,21 @@ declare module 'orca' {
     'bugs.media': { input: { detailId: string; resourceId: string; offset: number }; output: Answer<MediaChunk> }
     'bugs.close': { input: { detailId: string }; output: Answer<{closed:true}> }
     'bugs.list': { input: { team: string; after?: string }; output: Answer<TaskPage> }
-    'tasks.list': { input: { team: string; after?: string }; output: Answer<TaskPage> }
+    'tasks.list': { input: { team: string; after?: string; filter?: TaskFilter }; output: Answer<TaskPage> }
+    'tasks.projects': { input: { team: string }; output: Answer<Option[]> }
+    'tasks.iterations': { input: { team: string; projectId: string }; output: Answer<Option[]> }
+    'tasks.createOptions': { input: { team: string; projectId: string; date: string }; output: Answer<TaskCreateOptions> }
+    'git.folders': { input: { path?: string }; output: Answer<FolderPage> }
+    'git.pickFolders': { input: Record<string, never>; output: Answer<FolderSelection> }
+    'git.projects.load': { input: Record<string, never>; output: Answer<GitProjects> }
+    'git.projects.update': { input: GitProjectsChange; output: Answer<GitProjects> }
+    'git.resolveFolders': { input: { paths: string[] }; output: Answer<string[]> }
+    'git.read': { input: GitInput; output: Answer<GitReport> }
     'tasks.brief': { input: { team: string; taskId: string }; output: Answer<ImplementationBrief> }
     'day.read': { input: DayInput; output: Answer<Day> }
     'hours.preview': { input: PreviewInput; output: Answer<Preview> }
+    'hours.aiStart': { input: AiHoursInput; output: Answer<AiHoursJob> }
+    'hours.aiResult': { input: Pick<PreviewInput, 'dayId' | 'selection'> & { id: string }; output: Answer<AiHoursResult> }
     'hours.submit': { input: { previewId: string; confirmed: boolean }; output: Answer<{ count: number }> }
     'hours.list': { input: { team: string; date: string }; output: Answer<Worklog[]> }
     'recovery.list': { input: { team: string }; output: Answer<PendingWrite[]> }

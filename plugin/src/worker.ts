@@ -1,10 +1,15 @@
 import { RepairActions } from './repair-actions.ts'
+import { AiHoursWorkflow } from './ai-hours.ts'
+import { browseFolders, readGitLogs, resolveFolders } from './local-git.ts'
+import { NativeFolderPicker } from './native-folder-picker.ts'
+import { GitProjectStore } from './git-projects.ts'
+import { PreferenceStore } from './preferences.ts'
 import { StatusWorkflow } from './status-update.ts'
 import { FocusedProject } from './adapters/focused-project.ts'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { RepairWorkflow } from './repair.ts'
 import { Workbench } from './service.ts'
-import { safeFailure } from './domain/model.ts'
+import { requireThat, safeFailure } from './domain/model.ts'
 import type { Answer } from './protocol.ts'
 
 export default function activate(orca: OrcaWorkerApi): void {
@@ -12,8 +17,9 @@ export default function activate(orca: OrcaWorkerApi): void {
     store: { get: key => orca.storage.get(key), set: (key, value) => orca.storage.set(key, value as never), delete: key => orca.storage.delete(key) },
     vault: orca.secrets,
     protection: async () => (await orca.host.call('secrets.protection')).status === 'os-keyring',
-    // Not a setting or a panel parameter. Requires verified end-to-end evidence to change.
-    writesVerified: false
+    // Every write still requires a fresh attendance-backed preview, explicit confirmation,
+    // durable receipt and exact readback. Reading Git never invokes a write.
+    worklogWritesEnabled: true
   })
   const answer = async <T>(action: () => Promise<T>): Promise<Answer<T>> => {
     try { return { ok: true, value: await action() } }
@@ -24,7 +30,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     set: (key, value) => orca.storage.set(key, value as never),
     delete: key => orca.storage.delete(key)
   })
-  // 2026-11-10 正式 Worker 两步状态流转及独立回读已验证；仅开放 Adapter 支持的步骤，工时闸保持关闭。
+  // 2026-11-10 正式 Worker 两步状态流转及独立回读已验证；工时通过独立预览确认流程提交。
   const transitions = new StatusWorkflow(detailId => service.transitionContext(detailId), undefined, true, async detailId => (await repair.result(detailId))?.report)
   const repairActions = new RepairActions(repair,transitions)
   orca.panels.handle('bugs.businessOptions', input => answer(() => transitions.businessOptions(input.detailId,'已修复')))
@@ -54,7 +60,38 @@ export default function activate(orca: OrcaWorkerApi): void {
   orca.panels.handle('bugs.attachments', (input, context) => answer(() => service.detailAttachments(input.detailId, input.before, context.signal)))
   orca.panels.handle('bugs.media', (input, context) => answer(() => service.detailMedia(input.detailId, input.resourceId, input.offset, context.signal)))
   orca.panels.handle('bugs.close', input => answer(async () => { service.closeDetail(input.detailId); return {closed:true as const} }))
-  orca.panels.handle('tasks.list', (input, context) => answer(() => service.tasks(input.team, input.after, context.signal)))
+  orca.panels.handle('git.folders', input => answer(() => browseFolders(input.path)))
+  const folderPicker = new NativeFolderPicker()
+  const gitProjects = new GitProjectStore({ get: key => orca.storage.get(key), set: (key, value) => orca.storage.set(key, value as never), delete: key => orca.storage.delete(key) })
+  const preferences = new PreferenceStore({ get: key => orca.storage.get(key), set: (key, value) => orca.storage.set(key, value as never), delete: key => orca.storage.delete(key) })
+  const aiHours = new AiHoursWorkflow(service, gitProjects, { get: key => orca.storage.get(key), set: (key, value) => orca.storage.set(key, value as never), delete: key => orca.storage.delete(key) })
+  orca.panels.handle('hours.aiStart', (input, context) => answer(() => aiHours.start(input, context.signal)))
+  orca.panels.handle('hours.aiResult', (input, context) => answer(() => aiHours.result(input, context.signal)))
+  orca.panels.handle('preferences.load', () => answer(() => preferences.load()))
+  orca.panels.handle('preferences.update', input => answer(() => preferences.update(input)))
+  orca.panels.handle('credentials.load', input => answer(async () => {
+    requireThat(await orca.host.call('secrets.protection').then(r => r.status === 'os-keyring'), 'secrets', '系统凭证库暂不可用。')
+    return orca.secrets.get(`credential.${input.site}`)
+  }))
+  orca.panels.handle('credentials.save', input => answer(async () => {
+    requireThat(await orca.host.call('secrets.protection').then(r => r.status === 'os-keyring'), 'secrets', '系统凭证库暂不可用，密码未保存。')
+    requireThat(typeof input.password === 'string' && input.password.length > 0 && input.password.length <= 256, 'input', '密码格式无效。')
+    await orca.secrets.set(`credential.${input.site}`, input.password)
+    return { saved: true as const }
+  }))
+  orca.panels.handle('credentials.delete', input => answer(async () => {
+    await orca.secrets.delete(`credential.${input.site}`)
+    return { deleted: true as const }
+  }))
+  orca.panels.handle('git.projects.load', () => answer(() => gitProjects.load()))
+  orca.panels.handle('git.projects.update', input => answer(() => gitProjects.update(input)))
+  orca.panels.handle('git.pickFolders', (_input, context) => answer(() => folderPicker.pick(context.signal)))
+  orca.panels.handle('git.resolveFolders', input => answer(() => resolveFolders(input.paths)))
+  orca.panels.handle('git.read', (input, context) => answer(() => readGitLogs(input, context.signal)))
+  orca.panels.handle('tasks.projects', (input, context) => answer(() => service.projects(input.team, context.signal)))
+  orca.panels.handle('tasks.iterations', (input, context) => answer(() => service.iterations(input.team, input.projectId, context.signal)))
+  orca.panels.handle('tasks.createOptions', (input, context) => answer(() => service.taskCreateOptions(input.team, input.projectId, input.date, context.signal)))
+  orca.panels.handle('tasks.list', (input, context) => answer(() => service.tasks(input.team, input.after, context.signal, input.filter)))
   orca.panels.handle('tasks.brief', (input, context) => answer(() => service.brief(input.team, input.taskId, context.signal)))
   orca.panels.handle('day.read', (input, context) => answer(() => service.readDay(input, context.signal)))
   orca.panels.handle('hours.preview', (input, context) => answer(() => service.makePreview(input, context.signal)))

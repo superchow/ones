@@ -225,6 +225,18 @@ export default function activate(orca: OrcaWorkerApi): void {
       }
     },
     'tasks.list': () => ({ items: [task, normalTask], nextCursor: null }),
+    'git.projects.load': () => ({ version: 1, revision: 1, projects: [{ path: process.platform === 'win32' ? 'C:\\fixture\\repo' : '/fixture/repo', enabled: true }] }),
+    'git.read': (input) => ({
+      date: String(input.date),
+      commits: [{
+        hash: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        subject: '#89 虚构：修复与验证',
+        author: 'fixture@example.test',
+        time: '2026-11-09T04:00:00.000Z',
+        repository: process.platform === 'win32' ? 'C:\\fixture\\repo' : '/fixture/repo'
+      }],
+      repositories: [{ path: process.platform === 'win32' ? 'C:\\fixture\\repo' : '/fixture/repo', count: 1, truncated: false }]
+    }),
     'day.read': (input) => ({
       id: 'day-fixture',
       date: String(input.date),
@@ -253,6 +265,7 @@ export default function activate(orca: OrcaWorkerApi): void {
     }),
     'hours.preview': (input) => ({
       id: 'preview-fixture',
+      basis: (input.selection as { mode?: string }).mode === 'manual' ? 'manual' : 'punches',
       date: '2026-11-09',
       budget: 480,
       existing: 0,
