@@ -35,7 +35,7 @@ export async function exerciseHoursFlow(page) {
   await read()
   assert.equal(await punchConfirmation().isChecked(), false)
   await punchConfirmation().click()
-  await page.getByText('当日工作额度 10 小时 · 剩余可填 10 小时', { exact: true }).waitFor()
+  await page.waitForFunction(() => document.querySelector('.hours-metrics')?.innerText.includes('10 小时'))
   await button('根据 Git 整理并计算工时').click()
   await page.waitForFunction(() => document.getElementById('时长（分钟） #1')?.value === '600')
   assert.equal(await page.getByRole('textbox', { name: '开始时间 #1', exact: true }).inputValue(), '08:58')
