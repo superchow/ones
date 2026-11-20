@@ -2,7 +2,7 @@ import { OnesTransitions } from './adapters/ones-transitions.ts'
 import { filterProject, projectMappingKey, type ProjectMapping } from './domain/project-mapping.ts'
 import type { Option, TaskFilter } from './domain/model.ts'
 import { createHash, randomUUID } from 'node:crypto'
-import { type Allocation, type Attendance, type Preview, type Site, type Status, type Worklog, AppError, id, record, requireThat, text, validDate } from './domain/model.ts'
+import { type Allocation, type Attendance, type Preview, type Site, type Status, type Worklog, AppError, id, record, requireThat, safeFailure, text, validDate, validateAllocationTarget } from './domain/model.ts'
 import { apiHours, attendanceBudget, checkAllocations, existingMinutes, startSeconds, validateDescription } from './domain/attendance.ts'
 import { Submission, assertNoPending, createReceipt, parseReceipts, protectedDayHash, receiptCandidates, type Ledger, type Receipt } from './domain/submission.ts'
 import { type Day, type DayInput, type Draft, type ImplementationBrief, type LoginInput, type PreviewInput, type PendingWrite, type RecoveryPreview } from './protocol.ts'
@@ -10,6 +10,7 @@ import { COHO, ONES, Transport, type Fetcher } from './adapters/http.ts'
 import { loginOnes, refreshOnes, validateOnes, type OnesSession } from './adapters/ones-auth.ts'
 import { CohoClient, loginCoho, validateCoho, type CohoSession } from './adapters/coho.ts'
 import { OnesClient, worklogWriter } from './adapters/ones.ts'
+import { TaskCreator, taskCreationSignature, type TaskCreationPlan } from './adapters/task-creation.ts'
 import { BugMediaStore } from './adapters/bug-media.ts'
 import { assertDetailFits, type BugDetail, type Discussion, type Attachment, type DetailPage } from './adapters/bug-details.ts'
 import { allPages, mediaIds, type CompleteBug } from './domain/repair-content.ts'
@@ -18,7 +19,7 @@ export interface Store { get(key: string): Promise<unknown>; set(key: string, va
 export interface Vault { get(key: string): Promise<string | null>; set(key: string, value: string): Promise<void>; delete(key: string): Promise<void> }
 export interface Dependencies { store: Store; vault: Vault; protection(): Promise<boolean>; fetcher?: Fetcher; worklogWritesEnabled?: boolean }
 type Snapshot = { input: DayInput; data: Day; identity: string; stamp: string }
-type Confirmation = { view: Preview; snapshot: Snapshot; input: PreviewInput; identity: string }
+type Confirmation = { view: Preview; snapshot: Snapshot; input: PreviewInput; identity: string; creations: Map<string, TaskCreationPlan> }
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 
 export class Workbench {
@@ -468,27 +469,67 @@ export class Workbench {
   }
   async makePreview(input: PreviewInput, signal?: AbortSignal): Promise<Preview> {
     await this.ensureReady(); await this.ensureSession('ones')
-    const snapshot = this.day
-    requireThat(snapshot && snapshot.data.id === input.dayId && snapshot.identity === this.identity() && Date.now() - snapshot.data.attendance.fetchedAt < 300000, 'stale', '考勤或身份已过期，请重新读取。')
+    const snapshot = await this.currentDay(input.dayId, signal)
     const budget = attendanceBudget(snapshot.data.attendance, input.selection)
     const allocations = structuredClone(input.allocations)
     const proposed = checkAllocations(allocations, budget, snapshot.data.existing)
     const client = this.ones(snapshot.input.team)
-    const rows = []
+    const rows: Preview['rows'] = [], creations = new Map<string, TaskCreationPlan>()
+    const creator = new TaskCreator(client)
     for (const allocation of allocations) {
-      const task = await client.task(id(allocation.taskId), signal)
-      rows.push({ ...allocation, taskName: task.name })
+      if (allocation.newTask) {
+        requireThat(!allocation.taskId && !creations.has(allocation.newTask.key), 'input', '新任务建议标识重复或同时关联了现有任务。')
+        const plan = await creator.prepare(allocation.newTask, snapshot.input.date, signal)
+        creations.set(allocation.newTask.key, plan)
+        rows.push({ ...allocation, taskName: `将新建任务：${plan.payload.summary}`, creationDetails: plan.details })
+      } else {
+        const task = await client.task(id(allocation.taskId), signal)
+        rows.push({ ...allocation, taskName: task.name })
+      }
     }
     requireThat(this.day === snapshot && snapshot.identity === this.identity(), 'stale', '预览期间身份或考勤已变化。')
     const view: Preview = { id: randomUUID(), date: snapshot.input.date, budget, existing: snapshot.data.existing, proposed, remaining: budget - snapshot.data.existing - proposed, rows, expiresAt: Date.now() + 300000, basis: input.selection.mode === 'manual' ? 'manual' : 'punches' }
-    this.preview = { view, snapshot, input: structuredClone(input), identity: this.identity() }
+    this.preview = { view, snapshot, input: structuredClone(input), identity: this.identity(), creations }
     return view
+  }
+  async taskCreateOptions(team: string, projectId: string, date: string, signal?: AbortSignal) {
+    await this.ensureReady(); await this.ensureSession('ones')
+    return this.authenticated('ones', async () => {
+      const identity = this.identity(), client = this.ones(team)
+      await client.assertIdentity(signal)
+      const options = await new TaskCreator(client).options(projectId, date, signal)
+      requireThat(identity === this.identity(), 'stale', '读取期间账号已变化。')
+      return options
+    })
+  }
+  private async currentDay(dayId: string, signal?: AbortSignal): Promise<Snapshot> {
+    const snapshot = this.day
+    requireThat(snapshot && snapshot.data.id === dayId && snapshot.identity === this.identity(), 'stale', '考勤或身份已变化，请重新读取考勤并确认当日工时。')
+    if (Date.now() - snapshot.data.attendance.fetchedAt >= 300000) {
+      // AI analysis and manual review can outlive the read cache. Refresh evidence,
+      // preserving the confirmed snapshot ID only when all business fields match.
+      const fresh = await this.fetchDay(snapshot.input, signal)
+      requireThat(this.day === snapshot && snapshot.identity === this.identity(), 'stale', '刷新期间账号或所选日期已变化，请重新读取考勤。')
+      requireThat(fresh.stamp === snapshot.stamp, 'stale', '考勤或已登记工时已变化，请重新读取考勤、确认当日工时后重新计算；已有 AI 分析文件仍保留。')
+      snapshot.data = { ...fresh.data, id: snapshot.data.id }
+    }
+    return snapshot
+  }
+  async aiHoursContext(input: Pick<PreviewInput, 'dayId' | 'selection'>, signal?: AbortSignal) {
+    await this.ensureReady(); await this.ensureSession('ones'); await this.ensureSession('coho')
+    const snapshot = await this.currentDay(input.dayId, signal)
+    const budget = attendanceBudget(snapshot.data.attendance, input.selection)
+    const scope = this.scope(this.ones(snapshot.input.team))
+    const key = digest([scope, this.sessions.coho?.principal, snapshot.stamp, input.selection])
+    return { key, team: snapshot.input.team, date: snapshot.input.date, budget, existing: snapshot.data.existing,
+      remaining: budget - snapshot.data.existing, basis: input.selection.mode === 'manual' ? 'manual' : 'punches',
+      check: () => requireThat(this.day === snapshot && snapshot.identity === this.identity(), 'stale', '账号或考勤已变化，请重新读取。') }
   }
   async submit(previewId: string, confirmed: boolean): Promise<{ count: number }> {
     await this.ensureReady(); await this.ensureSession('ones')
     requireThat(this.deps.worklogWritesEnabled === true, 'not_enabled', '当前未启用工时提交。')
     requireThat(!this.writeBusy, 'busy', '另一个写入尚未结束。'); this.writeBusy = true
-    let count = 0
+    let count = 0, writeAttempted = false
     try {
       const confirmation = this.preview
       requireThat(confirmed === true && confirmation && confirmation.view.id === previewId && confirmation.identity === this.identity() && confirmation.view.expiresAt > Date.now(), 'stale', '请重新预览并确认工时。')
@@ -500,22 +541,39 @@ export class Workbench {
       checkAllocations(confirmation.input.allocations, budget, fresh.data.existing)
       const scope = digest([ONES, client.team, client.session.userId])
       const ledger = this.ledger()
+      assertNoPending(await ledger.load(), scope)
+      const creator = new TaskCreator(client)
+      for (const original of confirmation.creations.values()) {
+        const current = await creator.prepare(original.draft, fresh.input.date)
+        requireThat(taskCreationSignature(current.payload) === taskCreationSignature(original.payload), 'stale', '新任务实际创建内容发生变化，请重新预览确认。')
+      }
       const writer = new Submission(ledger, worklogWriter(client))
       for (const allocation of confirmation.input.allocations) {
         requireThat(this.identity() === confirmation.identity, 'identity', '身份发生变化，后续提交已停止。')
-        await client.task(allocation.taskId)
-        const rows = await client.worklogs(fresh.input.date)
+        let rows = await client.worklogs(fresh.input.date)
         checkAllocations([allocation], budget, existingMinutes(rows, fresh.input.date, client.session.userId))
-        const intent = { scope, date: fresh.input.date, task: allocation.taskId, owner: client.session.userId, hours: apiHours(allocation.minutes), startTime: startSeconds(fresh.input.date, allocation.start), description: allocation.description }
+        let taskId = allocation.taskId
+        if (allocation.newTask) {
+          writeAttempted = true
+          taskId = await creator.createOrRead(confirmation.creations.get(allocation.newTask.key)!, scope, fresh.input.date, this.deps.store, () => requireThat(this.identity() === confirmation.identity, 'identity', '账号已变化，创建已停止。'))
+        }
+        await client.task(taskId)
+        if (allocation.newTask) {
+          rows = await client.worklogs(fresh.input.date)
+          checkAllocations([allocation], budget, existingMinutes(rows, fresh.input.date, client.session.userId))
+        }
+        const intent = { scope, date: fresh.input.date, task: taskId, owner: client.session.userId, hours: apiHours(allocation.minutes), startTime: startSeconds(fresh.input.date, allocation.start), description: allocation.description }
         requireThat(this.identity() === confirmation.identity, 'identity', '提交前账号已变化，未发送本笔写入。')
+        writeAttempted = true
         await writer.add(intent, digest([previewId, count, intent]), rows); count++
       }
       this.invalidate()
       return { count }
     } catch (error) {
       this.preview = undefined
-      if (count > 0 || !(error instanceof AppError)) throw new AppError('worklog-partial', `本批已有 ${count} 笔完成回读，其余未完成或结果待核实；请先查看工时记录及待核对提交，勿整批重发。`)
-      throw error
+      if (writeAttempted) throw new AppError('worklog-partial', `本批已有 ${count} 笔完成回读，其余未完成或结果待核实；请先查看工时记录及待核对提交，勿整批重发。${error instanceof AppError ? error.message : ''}`)
+      if (error instanceof AppError && ['auth', 'identity'].includes(error.code)) throw error
+      throw new AppError('worklog-preflight', safeFailure(error).message)
     } finally { this.writeBusy = false }
   }
   private ledger(): Ledger {
@@ -631,7 +689,7 @@ export class Workbench {
     await this.ensureReady()
     requireThat(this.sessions.ones && this.sessions.coho, 'identity', '请先登录两站，草稿需要绑定本人身份。')
     validDate(draft.date); requireThat(Array.isArray(draft.allocations) && draft.allocations.length <= 20, 'input', '草稿最多 20 笔。')
-    for (const row of draft.allocations) { id(row.taskId); apiHours(row.minutes); text(row.description, 2000) }
+    for (const row of draft.allocations) { validateAllocationTarget(row); apiHours(row.minutes); text(row.description, 2000) }
     await this.deps.store.set('draft', { owner: digest([this.sessions.ones.userId, this.sessions.coho.principal]), value: draft })
     return { saved: true }
   }
@@ -644,7 +702,7 @@ export class Workbench {
     this.invalidate() // restored data never carries confirmation or attendance authority
     const value = record(raw.value); validDate(value.date)
     requireThat(Array.isArray(value.allocations) && value.allocations.length <= 20, 'schema', '本机草稿格式无效。')
-    for (const entry of value.allocations) { const row = record(entry); id(row.taskId); apiHours(row.minutes as number); text(row.start, 5); text(row.description, 2000) }
+    for (const entry of value.allocations) { const row = record(entry); validateAllocationTarget(row); apiHours(row.minutes as number); text(row.start, 5); text(row.description, 2000) }
     return value as unknown as Draft
   }
 }

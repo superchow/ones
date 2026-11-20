@@ -1,4 +1,5 @@
 import { RepairActions } from './repair-actions.ts'
+import { AiHoursWorkflow } from './ai-hours.ts'
 import { browseFolders, readGitLogs, resolveFolders } from './local-git.ts'
 import { NativeFolderPicker } from './native-folder-picker.ts'
 import { GitProjectStore } from './git-projects.ts'
@@ -8,7 +9,7 @@ import { FocusedProject } from './adapters/focused-project.ts'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { RepairWorkflow } from './repair.ts'
 import { Workbench } from './service.ts'
-import { safeFailure } from './domain/model.ts'
+import { requireThat, safeFailure } from './domain/model.ts'
 import type { Answer } from './protocol.ts'
 
 export default function activate(orca: OrcaWorkerApi): void {
@@ -63,8 +64,25 @@ export default function activate(orca: OrcaWorkerApi): void {
   const folderPicker = new NativeFolderPicker()
   const gitProjects = new GitProjectStore({ get: key => orca.storage.get(key), set: (key, value) => orca.storage.set(key, value as never), delete: key => orca.storage.delete(key) })
   const preferences = new PreferenceStore({ get: key => orca.storage.get(key), set: (key, value) => orca.storage.set(key, value as never), delete: key => orca.storage.delete(key) })
+  const aiHours = new AiHoursWorkflow(service, gitProjects, { get: key => orca.storage.get(key), set: (key, value) => orca.storage.set(key, value as never), delete: key => orca.storage.delete(key) })
+  orca.panels.handle('hours.aiStart', (input, context) => answer(() => aiHours.start(input, context.signal)))
+  orca.panels.handle('hours.aiResult', (input, context) => answer(() => aiHours.result(input, context.signal)))
   orca.panels.handle('preferences.load', () => answer(() => preferences.load()))
   orca.panels.handle('preferences.update', input => answer(() => preferences.update(input)))
+  orca.panels.handle('credentials.load', input => answer(async () => {
+    requireThat(await orca.host.call('secrets.protection').then(r => r.status === 'os-keyring'), 'secrets', '系统凭证库暂不可用。')
+    return orca.secrets.get(`credential.${input.site}`)
+  }))
+  orca.panels.handle('credentials.save', input => answer(async () => {
+    requireThat(await orca.host.call('secrets.protection').then(r => r.status === 'os-keyring'), 'secrets', '系统凭证库暂不可用，密码未保存。')
+    requireThat(typeof input.password === 'string' && input.password.length > 0 && input.password.length <= 256, 'input', '密码格式无效。')
+    await orca.secrets.set(`credential.${input.site}`, input.password)
+    return { saved: true as const }
+  }))
+  orca.panels.handle('credentials.delete', input => answer(async () => {
+    await orca.secrets.delete(`credential.${input.site}`)
+    return { deleted: true as const }
+  }))
   orca.panels.handle('git.projects.load', () => answer(() => gitProjects.load()))
   orca.panels.handle('git.projects.update', input => answer(() => gitProjects.update(input)))
   orca.panels.handle('git.pickFolders', (_input, context) => answer(() => folderPicker.pick(context.signal)))
@@ -72,6 +90,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   orca.panels.handle('git.read', (input, context) => answer(() => readGitLogs(input, context.signal)))
   orca.panels.handle('tasks.projects', (input, context) => answer(() => service.projects(input.team, context.signal)))
   orca.panels.handle('tasks.iterations', (input, context) => answer(() => service.iterations(input.team, input.projectId, context.signal)))
+  orca.panels.handle('tasks.createOptions', (input, context) => answer(() => service.taskCreateOptions(input.team, input.projectId, input.date, context.signal)))
   orca.panels.handle('tasks.list', (input, context) => answer(() => service.tasks(input.team, input.after, context.signal, input.filter)))
   orca.panels.handle('tasks.brief', (input, context) => answer(() => service.brief(input.team, input.taskId, context.signal)))
   orca.panels.handle('day.read', (input, context) => answer(() => service.readDay(input, context.signal)))
