@@ -25,6 +25,9 @@ export class OnesClient {
     requireThat(session.teams.some(t => t.id === team), 'identity', '所选团队不属于当前登录身份。')
   }
   private get base() { return `/project/api/project/team/${this.team}` }
+  api(path: string, body?: Record<string, unknown>, signal?: AbortSignal) {
+    return this.transport.json(this.base + path, { ...(body ? jsonBody(body, this.session.token) : { headers: { Authorization: `Bearer ${this.session.token}` } }), signal })
+  }
   async assertIdentity(signal?: AbortSignal): Promise<void> {
     const user = await this.transport.json('/project/api/project/users/me', { headers: { Authorization: `Bearer ${this.session.token}` }, signal })
     requireThat(user.uuid === this.session.userId, 'identity', '当前 ONES 身份已变化。')
