@@ -1,4 +1,6 @@
 import type { RepairActions } from './repair-actions.ts'
+import type { AiHoursInput, AiHoursJob, AiHoursResult } from './ai-hours.ts'
+import type { TaskCreateOptions } from './adapters/task-creation.ts'
 import type { Preferences, PreferenceChange } from './preferences.ts'
 import type { FolderPage, GitInput, GitReport } from './local-git.ts'
 import type { FolderSelection } from './native-folder-picker.ts'
@@ -25,6 +27,9 @@ declare module 'orca' {
   interface PluginRequests {
     'preferences.load': { output: Answer<Preferences> }
     'preferences.update': { input: PreferenceChange; output: Answer<{ saved: true }> }
+    'credentials.load': { input: { site: Site }; output: Answer<string | null> }
+    'credentials.save': { input: { site: Site; password: string }; output: Answer<{ saved: true }> }
+    'credentials.delete': { input: { site: Site }; output: Answer<{ deleted: true }> }
     'bugs.transitionReconcile': { input: { detailId: string; operationId: string }; output: Answer<StatusResult> }
 
     'bugs.projectFilter': { input: { team: string; projects: Option[] }; output: Answer<{ localProject: Option | null; project: Option | null }> }
@@ -51,6 +56,7 @@ declare module 'orca' {
     'tasks.list': { input: { team: string; after?: string; filter?: TaskFilter }; output: Answer<TaskPage> }
     'tasks.projects': { input: { team: string }; output: Answer<Option[]> }
     'tasks.iterations': { input: { team: string; projectId: string }; output: Answer<Option[]> }
+    'tasks.createOptions': { input: { team: string; projectId: string; date: string }; output: Answer<TaskCreateOptions> }
     'git.folders': { input: { path?: string }; output: Answer<FolderPage> }
     'git.pickFolders': { input: Record<string, never>; output: Answer<FolderSelection> }
     'git.projects.load': { input: Record<string, never>; output: Answer<GitProjects> }
@@ -60,6 +66,8 @@ declare module 'orca' {
     'tasks.brief': { input: { team: string; taskId: string }; output: Answer<ImplementationBrief> }
     'day.read': { input: DayInput; output: Answer<Day> }
     'hours.preview': { input: PreviewInput; output: Answer<Preview> }
+    'hours.aiStart': { input: AiHoursInput; output: Answer<AiHoursJob> }
+    'hours.aiResult': { input: Pick<PreviewInput, 'dayId' | 'selection'> & { id: string }; output: Answer<AiHoursResult> }
     'hours.submit': { input: { previewId: string; confirmed: boolean }; output: Answer<{ count: number }> }
     'hours.list': { input: { team: string; date: string }; output: Answer<Worklog[]> }
     'recovery.list': { input: { team: string }; output: Answer<PendingWrite[]> }
