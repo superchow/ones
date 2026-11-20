@@ -42,6 +42,7 @@ export class WorkbenchUI {
   private detail?: DetailView
   private accounts: Record<Site, string> = { ones: '', coho: '' }
   private passwords: Record<Site, string> = { ones: '', coho: '' }
+  private rememberPasswords: Record<Site, boolean> = { ones: false, coho: false }
   private httpConsent = false
   private preferences = defaultPreferences()
   private preferencesLoaded = false
@@ -281,6 +282,7 @@ export class WorkbenchUI {
     this.clearBusiness()
     this.restoreFilters()
     let password = this.passwords[site]
+    const remember = this.rememberPasswords[site]
     this.passwords[site] = ''
     try {
       await this.run(
@@ -293,6 +295,11 @@ export class WorkbenchUI {
         (value) => {
           this.acceptStatus(value)
           this.info = '已完成认证与身份回读。'
+          if (remember) {
+            void request('credentials.save', { site, password }).catch(() => {})
+          } else {
+            void request('credentials.delete', { site }).catch(() => {})
+          }
         }
       )
     } finally {
@@ -306,6 +313,7 @@ export class WorkbenchUI {
     this.clearBusiness()
     this.restoreFilters()
     this.passwords[site] = ''
+    void request('credentials.delete', { site }).catch(() => {})
     void this.run(
       (signal) => request<Status>('auth.logout', { site }, signal),
       (value) => this.acceptStatus(value)
@@ -497,7 +505,6 @@ export class WorkbenchUI {
       dialog.remove()
       this.passwords = { ones: '', coho: '' }
       this.render()
-      document.getElementById('account-settings-trigger')?.focus({ preventScroll: true })
       if (this.tab === 'bugs' && !this.bugLoaded && !this.bugLoading) void this.loadBugs()
       if (this.tab === 'implementation' && !this.implementation && !this.detail) this.showImplementation()
     })
@@ -505,6 +512,15 @@ export class WorkbenchUI {
     document.body.append(dialog)
     this.render()
     dialog.showModal()
+    // Load saved credentials in the background and fill in if the dialog is still open.
+    for (const site of ['ones', 'coho'] as const) {
+      void request<string | null>('credentials.load', { site }).then((saved) => {
+        if (this.settingsDialog !== dialog || !saved) return
+        this.passwords[site] = saved
+        this.rememberPasswords[site] = true
+        this.render()
+      }).catch(() => {})
+    }
   }
   private renderSettings(): void {
     const dialog = this.settingsDialog
@@ -555,6 +571,15 @@ export class WorkbenchUI {
           },
           { type: 'password', disabled: this.busy }
         ),
+        check(
+          '记住密码（加密保存到系统凭证库）',
+          this.rememberPasswords[site],
+          (v) => {
+            this.rememberPasswords[site] = v
+            this.render()
+          },
+          this.busy
+        ),
         site === 'ones'
           ? check(
               '我确认仅在可信内网使用 HTTP，了解密码及令牌的传输风险',
@@ -580,7 +605,7 @@ export class WorkbenchUI {
       )
     }
     return stack(
-      text('账号和页面设置自动保存。密码仅用于本次登录；令牌加密保存，ONES 支持续期，Coho 按服务端有效期恢复。', true),
+      text('账号和页面设置自动保存。勾选"记住密码"后登录成功会将密码加密存入系统凭证库，下次打开自动填充；令牌加密保存，ONES 支持续期，Coho 按服务端有效期恢复。', true),
       login('ones'),
       (this.status?.teams.length ?? 0) > 1 ? this.teamSelect() : null,
       login('coho'),
@@ -847,15 +872,14 @@ export class WorkbenchUI {
               ? this.records.render()
               : (this.detail?.element ?? this.implementation?.element ?? text('请选择团队后点击“实施”查看执行记录。', true))
     this.root.classList.add('workbench')
-    const connection = (site: Site, label: string) => el('span',
-      'connection-badge' + (this.status?.[site].connected ? ' connected' : ''),
-      icon('shield'), label + (this.status?.[site].connected ? ' 已认证' : ' 未登录'))
-    const account = button('', () => this.openSettings(), this.busy, 'account-settings-trigger')
-    account.id = 'account-settings-trigger'
-    account.title = '账号配置'
-    account.setAttribute('aria-label', '账号配置')
-    account.setAttribute('aria-haspopup', 'dialog')
-    account.append(icon('settings'))
+    const connection = (site: Site, label: string) => {
+      const btn = button('', () => this.openSettings(), this.busy, 'connection-badge' + (this.status?.[site].connected ? ' connected' : ''))
+      btn.title = '账号配置'
+      btn.setAttribute('aria-label', label + (this.status?.[site].connected ? ' 已认证，点击账号配置' : ' 未登录，点击账号配置'))
+      btn.setAttribute('aria-haspopup', 'dialog')
+      btn.append(icon('shield'), label + (this.status?.[site].connected ? ' 已认证' : ' 未登录'))
+      return btn
+    }
     this.root.replaceChildren(
       el('header', 'workbench-header',
         el('div', 'planet-scene', el('span', 'planet'), el('span', 'orbit')),
@@ -866,13 +890,13 @@ export class WorkbenchUI {
             text('从问题到实施，从考勤到工时', true)
           )
         ),
-        el('div', 'row connections', connection('ones', 'ONES'), connection('coho', 'Coho'), account)
+        el('div', 'row connections', connection('ones', 'ONES'), connection('coho', 'Coho'))
       ),
       nav,
       ...(this.busy && !this.settingsDialog
         ? [
             row(
-              notice('正在处理，请勿重复提交'),
+              notice(this.tab === 'hours' ? this.hours.activity ?? '正在处理，请勿重复提交' : '正在处理，请勿重复提交'),
               button('取消当前请求', () => this.cancel())
             )
           ]
