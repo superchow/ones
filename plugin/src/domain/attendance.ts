@@ -1,4 +1,4 @@
-import { type Allocation, type Attendance, type AttendanceSelection, type Worklog, requireThat, minuteOfDay, validDate } from './model.ts'
+import { type Allocation, type Attendance, type AttendanceSelection, type Worklog, requireThat, minuteOfDay, validDate, validateAllocationTarget } from './model.ts'
 
 // Select the two unambiguous same-day records without treating selection as
 // confirmation or changing the attendance budget rules.
@@ -65,6 +65,7 @@ export function checkAllocations(rows: Allocation[], budget: number, existing: n
   requireThat(rows.length > 0 && rows.length <= 20, 'input', '请分配 1～20 笔工时。')
   let total = 0
   for (const row of rows) {
+    validateAllocationTarget(row)
     apiHours(row.minutes)
     minuteOfDay(row.start)
     validateDescription(row.description)
